@@ -66,7 +66,9 @@ Change one thing at a time and re-test against several real releases. `npm run s
 
 **Subtitles are consistently a fixed amount late or early.** The chosen track was validated, so the offset is inside tolerance but not zero. Check the logged `midpointOffsetMs`; if it is large and the result still looks wrong, the wrong candidate won — raise `MINIMUM_CONFIDENCE`.
 
-**Nothing is ever returned for a title.** Look at the log line from the audio analysis. Few or zero transcripts usually means an unusual audio codec, a mislabelled track, or no Deepgram key. `REFERENCE_LANGUAGES` can help when the original language has thin subtitle coverage.
+**Nothing is ever returned for a title.** Look at the log line from the audio analysis. Few or zero transcripts usually means an unusual audio codec, a mislabelled track, or no Deepgram key.
+
+**Everything about a title goes through the fallback route.** Check `route` in `/stats`: `source` means a subtitle in the spoken language carried the timing, `reference` means another language did, `audio` means the target was matched against speech activity alone. A film whose original language has few subtitles — anime, most non-English cinema — will legitimately sit on `reference`. If it sits on `audio` often, add languages to `FALLBACK_REFERENCE_LANGUAGES`, because a whole-title event match is much stronger evidence than four sampled windows.
 
 **Everything is translated even though target-language subtitles exist.** They were downloaded and rejected: their cue events did not match the trusted track. That is often correct — different cut, different release. Lower `MINIMUM_CONFIDENCE` only after checking a few by hand.
 

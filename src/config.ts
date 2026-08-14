@@ -5,6 +5,14 @@ export interface AppConfig {
   providerTimeoutMs: number;
   minimumConfidence: number;
   referenceLanguages: string[];
+  /**
+   * Languages allowed to act as a timing reference when nothing in the spoken
+   * language can be trusted. Validated against speech activity rather than
+   * against the transcript, so they need not match the audio's language.
+   */
+  fallbackReferenceLanguages: string[];
+  /** Bar for matches backed only by speech activity, which is weaker evidence. */
+  activityMinimumConfidence: number;
   upstreamAddonUrl?: string;
   audioAnalysisEnabled: boolean;
   dataDir: string;
@@ -95,6 +103,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     providerTimeoutMs: asInt(env.PROVIDER_TIMEOUT_MS, 8_000, 1_000, 60_000),
     minimumConfidence: asInt(env.MINIMUM_CONFIDENCE, 58, 0, 100),
     referenceLanguages: asList(env.REFERENCE_LANGUAGES),
+    fallbackReferenceLanguages: env.FALLBACK_REFERENCE_LANGUAGES === "" ? [] : (asList(env.FALLBACK_REFERENCE_LANGUAGES).length ? asList(env.FALLBACK_REFERENCE_LANGUAGES) : ["en"]),
+    activityMinimumConfidence: asInt(env.ACTIVITY_MINIMUM_CONFIDENCE, Math.min(95, asInt(env.MINIMUM_CONFIDENCE, 58, 0, 100) + 12), 0, 100),
     upstreamAddonUrl: env.UPSTREAM_ADDON_URL?.replace(/\/+$/, ""),
     audioAnalysisEnabled: env.AUDIO_ANALYSIS_ENABLED !== "false",
     dataDir: env.DATA_DIR || "./data",

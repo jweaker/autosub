@@ -187,6 +187,52 @@ describe("subtitle pipeline", () => {
     expect(result.content).toContain("عربي");
   });
 
+  it("uses another language as the timing reference when the spoken one has nothing", async () => {
+    // Anime is the standard case: TMDB says Japanese, four Japanese subtitles
+    // exist and two are junk, while the English catalogue has hundreds.
+    probe.current = makeProbe(sourceCues, shiftMs, "ja");
+    const arabic = sourceCues.map((cue) => ({ ...cue, startMs: cue.startMs - 2_500, endMs: cue.endMs - 2_500, text: `عربي ${cue.id}` }));
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(arabic) }],
+    ]));
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("translation must not be reached");
+    }));
+
+    const pipeline = new AutoSubPipeline(await config({ REFERENCE_LANGUAGES: "", GEMINI_API_KEY: "k" }), [provider]);
+    const result = await pipeline.complete(request, stream, "ar");
+    expect(result.translated).toBe(false);
+    expect(result.content).toContain("عربي");
+    expect(pipeline.recentRuns()[0].route).toBe("reference");
+  });
+
+  it("accepts a target on speech activity alone when no other language helps", async () => {
+    probe.current = makeProbe(sourceCues, shiftMs, "ja");
+    const arabic = sourceCues.map((cue) => ({ ...cue, text: `عربي ${cue.id}` }));
+    const provider = new FakeProvider("fake", new Map([["ar-1", { language: "ar", content: serializeSrt(arabic) }]]));
+
+    const pipeline = new AutoSubPipeline(await config({ REFERENCE_LANGUAGES: "", GEMINI_API_KEY: "k" }), [provider]);
+    const result = await pipeline.complete(request, stream, "ar");
+    expect(result.content).toContain("عربي");
+    expect(pipeline.recentRuns()[0].route).toBe("audio");
+  });
+
+  it("holds activity-only matches to a higher bar", async () => {
+    probe.current = makeProbe(sourceCues, shiftMs, "ja");
+    const arabic = sourceCues.map((cue) => ({ ...cue, text: `عربي ${cue.id}` }));
+    const provider = new FakeProvider("fake", new Map([["ar-1", { language: "ar", content: serializeSrt(arabic) }]]));
+
+    // Weaker evidence has to clear a higher threshold than a transcript match.
+    // With nothing in the spoken language either, there is not even a text to
+    // translate, so the run fails rather than falling through to the model.
+    const pipeline = new AutoSubPipeline(
+      await config({ REFERENCE_LANGUAGES: "", GEMINI_API_KEY: "k", ACTIVITY_MINIMUM_CONFIDENCE: "101" }),
+      [provider],
+    );
+    await expect(pipeline.complete(request, stream, "ar")).rejects.toThrow(/matched the transcribed audio/);
+  });
+
   it("does not translate unless the viewer asks", async () => {
     const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(sourceCues) }]]));
     const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key" }), [provider]);

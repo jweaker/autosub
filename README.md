@@ -61,8 +61,9 @@ Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` 
 5. **Candidate search.** OpenSubtitles, SubDL, and SubSource are searched concurrently and the results ranked by hash match, release-name similarity, source, group, edition, and frame rate.
 6. **Validation.** Candidates are downloaded in waves — the best entry from each provider at a time — and scored against the speech timeline. A global model corrects constant delay and constrained frame-rate drift (50 ms / 0.01% precision). Anything that only fits in places is rejected.
 7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. A source track that no candidate can align to is discarded and the next best one tried, because a subtitle cut for a different edit can match the audio and still be a useless reference.
-8. **Translation, only if asked.** When no candidate matches any trusted track, AutoSub says so and offers a translation from the subtitle menu. The chosen engine then translates the corrected source text; timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. Set `TRANSLATION_MODE=auto` to have it happen unprompted, or `off` to disable it. See [docs/translation.md](docs/translation.md) for choosing an engine.
-9. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
+8. **When the spoken language has nothing.** Some films — anime especially — have a handful of subtitles in their original language and hundreds in English. Speech activity is language-independent, so an English subtitle can be validated against the audio and then vouch for the Arabic one across the whole title. Failing even that, the Arabic track is checked against speech activity directly. Both answer to a higher confidence bar than a transcript match.
+9. **Translation, only if asked.** When no candidate matches any trusted track, AutoSub says so and offers a translation from the subtitle menu. The chosen engine then translates the corrected source text; timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. Set `TRANSLATION_MODE=auto` to have it happen unprompted, or `off` to disable it. See [docs/translation.md](docs/translation.md) for choosing an engine.
+10. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
 
 If nothing passes, AutoSub says so rather than serving a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
 
@@ -132,6 +133,7 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `UPSTREAM_ADDON_URL` | — | Configured stream addon manifest to wrap |
 | `DEFAULT_LANGUAGES` | `ar` | Subtitle languages to deliver |
 | `MINIMUM_CONFIDENCE` | `58` | Reject anything scoring lower |
+| `FALLBACK_REFERENCE_LANGUAGES` | `en` | Languages that may carry timing when the spoken language has no usable subtitle |
 | `CANDIDATE_LIMIT` | `10` | Candidates downloaded and validated per language |
 | `JOB_WAIT_MS` | `120000` | How long a subtitle request waits for preparation |
 | `CACHE_TTL_DAYS` | `30` | Age at which cached subtitles are swept |

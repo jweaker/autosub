@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alignSubtitleToReference, alignSubtitleToTranscript } from "./alignment.js";
+import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript } from "./alignment.js";
 import { AudioAnalyzer } from "./audio.js";
 import { stableKey, SubtitleCache } from "./cache.js";
 import type { AppConfig } from "./config.js";
@@ -28,6 +28,9 @@ export interface RunSummary {
   contentId: string;
   language: string;
   outcome: "cached" | "direct" | "translated" | "failed";
+  /** Which evidence produced the answer: the spoken-language track, another
+   * language's track, or the audio itself. */
+  route?: "source" | "reference" | "audio";
   provider?: string;
   confidence?: number;
   release?: string;
@@ -191,12 +194,83 @@ export class AutoSubPipeline {
     }
   }
 
+  /**
+   * Last resort before translation: find a timing reference that does not
+   * depend on the spoken language.
+   *
+   * First another language's subtitle validated against speech activity, whose
+   * events then vouch for the target across the whole title; failing that, the
+   * target checked against speech activity on its own. Both are weaker evidence
+   * than a transcript match, so both answer to a higher bar.
+   */
+  private async matchWithoutSpokenSource(
+    request: SubtitleRequest,
+    probe: AudioProbeResult,
+    targetCandidates: SubtitleCandidate[],
+    excluded: Set<string>,
+    sourceLanguages: string[],
+    target: string,
+    mark: <T>(stage: string, work: Promise<T>) => Promise<T>,
+  ): Promise<{ subtitle: Omit<CompletedSubtitle, "key">; evaluated: Evaluated; route: "reference" | "audio" } | undefined> {
+    const maxOffsetMs = this.config.maxSyncOffsetSeconds * 1000;
+    const byActivity: Aligner = (cues) => alignSubtitle(cues, probe.windows, maxOffsetMs);
+    const bar = this.config.activityMinimumConfidence;
+
+    const languages = this.config.fallbackReferenceLanguages
+      .filter((language) => language !== target && !sourceLanguages.includes(language));
+    if (languages.length) {
+      const candidates = await mark("searchFallback", this.search(request, languages));
+      const reference = await mark("validateFallbackReference", this.evaluate(request, candidates, byActivity, excluded, bar));
+      if (reference) {
+        console.log(`Using a ${normalizeLanguage(reference.ranked.candidate.language) || languages[0]} subtitle as the timing reference (confidence=${reference.confidence})`);
+        const referenceCues = parseSrt(reference.content);
+        const matched = await mark("validateTargetFallback", this.evaluate(
+          request,
+          targetCandidates,
+          (cues) => alignSubtitleToReference(cues, referenceCues, maxOffsetMs),
+          excluded,
+        ));
+        if (matched) {
+          return {
+            evaluated: matched,
+            route: "reference",
+            subtitle: {
+              id: variantId(matched.ranked.candidate),
+              language: target,
+              content: matched.content,
+              confidence: Math.min(reference.confidence, matched.confidence),
+              provider: matched.ranked.candidate.provider,
+              translated: false,
+            },
+          };
+        }
+      }
+    }
+
+    const direct = await mark("validateTargetAudio", this.evaluate(request, targetCandidates, byActivity, excluded, bar));
+    if (!direct) return undefined;
+    console.log(`Accepted a ${target} subtitle on speech activity alone (confidence=${direct.confidence})`);
+    return {
+      evaluated: direct,
+      route: "audio",
+      subtitle: {
+        id: variantId(direct.ranked.candidate),
+        language: target,
+        content: direct.content,
+        confidence: direct.confidence,
+        provider: direct.ranked.candidate.provider,
+        translated: false,
+      },
+    };
+  }
+
   /** Downloads and validates candidates in waves, stopping at the first confident match. */
   private async evaluate(
     request: SubtitleRequest,
     candidates: SubtitleCandidate[],
     align: Aligner,
     excluded: Set<string>,
+    minimumConfidence = this.config.minimumConfidence,
   ): Promise<Evaluated | undefined> {
     const usable = candidates.filter((candidate) => !excluded.has(variantId(candidate)));
     const remaining = rankCandidates(request, usable).slice(0, this.config.candidateLimit);
@@ -205,7 +279,7 @@ export class AutoSubPipeline {
       const wave = this.nextWave(remaining);
       const results = await Promise.all(wave.map((item) => this.evaluateCandidate(item, align)));
       for (const result of results) {
-        if (result && result.confidence >= this.config.minimumConfidence) accepted.push(result);
+        if (result && result.confidence >= minimumConfidence) accepted.push(result);
       }
       if (accepted.length) break;
     }
@@ -290,7 +364,7 @@ export class AutoSubPipeline {
         stages[stage] = Date.now() - from;
       });
     };
-    const summary = (outcome: RunSummary["outcome"], result?: CompletedSubtitle, translation?: RunSummary["translation"]): void => this.record({
+    const summary = (outcome: RunSummary["outcome"], result?: CompletedSubtitle, translation?: RunSummary["translation"], route?: RunSummary["route"]): void => this.record({
       at: new Date().toISOString(),
       contentId: request.contentId,
       language: target,
@@ -301,6 +375,7 @@ export class AutoSubPipeline {
       totalMs: Date.now() - started,
       stages,
       translation,
+      route,
     });
 
     const cached = await this.cache.get(key);
@@ -366,7 +441,7 @@ export class AutoSubPipeline {
           provider: source.ranked.candidate.provider,
           translated: false,
         });
-        summary("direct", result);
+        summary("direct", result, undefined, "source");
         return result;
       }
 
@@ -388,13 +463,26 @@ export class AutoSubPipeline {
           provider: direct.ranked.candidate.provider,
           translated: false,
         });
-        summary("direct", result);
+        summary("direct", result, undefined, "source");
         return result;
       }
 
       console.warn(`No ${target} subtitle matched the ${source.ranked.candidate.provider}:${source.ranked.candidate.providerId} timing track; trying another source`);
       rejectedSources.add(variantId(source.ranked.candidate));
       source = undefined;
+    }
+
+    // Nothing in the spoken language could carry the timing. The audio itself
+    // is language-independent evidence, so a subtitle in another language can
+    // be checked against speech activity and then vouch for the target — which
+    // is what matters for a film whose original language has a handful of
+    // subtitles but whose English catalogue has hundreds.
+    const fallback = await this.matchWithoutSpokenSource(request, probe, targetCandidates, excluded, sourceLanguages, target, mark);
+    if (fallback) {
+      const result = await this.store({ key, ...fallback.subtitle });
+      log(`Fallback ${target} subtitle`, fallback.evaluated, probe, started, stages);
+      summary("direct", result, undefined, fallback.route);
+      return result;
     }
 
     if (!source) {

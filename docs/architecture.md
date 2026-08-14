@@ -77,8 +77,9 @@ The subtitle list is requested *before* or *around* the play redirect depending 
 2. **Parallel start.** Audio analysis and provider searches are launched together; the searches for the source language do not wait for the probe.
 3. **Source validation.** Candidates in the original language are aligned against the transcript (`alignSubtitleToTranscript`). The winner becomes the *trusted timing track*.
 4. **Target validation.** Candidates in the target language are aligned against that trusted track (`alignSubtitleToReference`). A match is served directly, with the lower of the two confidences.
-5. **Translation fallback.** If nothing matches, Gemini translates the trusted track's text. The model sees cue ids and text only.
-6. **Store.** Success is written to the cache; a cache write failure costs time on the next play but never fails the request.
+5. **Language-independent fallback.** If no subtitle in the spoken language can carry the timing, a subtitle in another language is validated against speech activity and used as the reference instead; failing that, the target is checked against speech activity directly. Speech activity does not care what language a subtitle is written in, which is what makes this possible — and it is weaker evidence, so both routes answer to `ACTIVITY_MINIMUM_CONFIDENCE`.
+6. **Translation fallback.** If nothing matches at all, and only when asked, the configured engine translates the trusted track's text. It sees cue ids and text only.
+7. **Store.** Success is written to the cache; a cache write failure costs time on the next play but never fails the request.
 
 Each result carries a variant id — `provider:providerId`, or that id prefixed with `gemini:` for a translation — which is what a rejection records. Rejecting a translation bars its source track, because reusing that track would produce the same translation again. Audio probes are kept in memory per release, so a rejection-driven re-run skips ffmpeg entirely and finishes in seconds.
 
