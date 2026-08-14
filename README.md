@@ -142,7 +142,7 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
 | `TRANSLATION_MODE` | `manual` | `manual` offers translation in the menu, `auto` runs it unprompted, `off` disables it |
 | `TRANSLATION_PROVIDER` | `gemini` | `gemini`, `openai` (any chat-completions endpoint), `deepl`, or `libretranslate` |
-| `TRANSLATION_CONCURRENCY` | `4` | Independent AI translation batches processed at once (1–12) |
+| `TRANSLATION_CONCURRENCY` | `12` | Maximum independent AI batches; automatically reduced under endpoint backpressure (1–12) |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
 

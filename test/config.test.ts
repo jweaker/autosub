@@ -7,6 +7,8 @@ describe("configuration", () => {
   it("applies documented defaults", () => {
     const config = loadConfig({ ...base });
     expect(config).toMatchObject({ port: 7000, defaultLanguages: ["ar"], minimumConfidence: 58, candidateLimit: 10 });
+    expect(config.translation.concurrency).toBe(12);
+    expect(config.gemini.concurrency).toBe(12);
   });
 
   it("trims trailing slashes from URLs", () => {

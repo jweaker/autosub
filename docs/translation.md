@@ -39,15 +39,18 @@ TRANSLATION_PROVIDER=openai
 TRANSLATION_BASE_URL=https://your-gateway.example/v1
 TRANSLATION_API_KEY=...
 TRANSLATION_MODEL=your-model
-TRANSLATION_CONCURRENCY=4
+TRANSLATION_CONCURRENCY=12
 TRANSLATION_TIMEOUT_MS=180000
 ```
 
-Reasoning models are slow enough to matter here: measured at roughly 27 seconds
-per 60-cue batch, a feature film can still take several minutes. Batches run at
-a concurrency of four by default, cutting the critical path to roughly a
-quarter of sequential time when the endpoint has capacity. That may still be
-longer than `JOB_WAIT_MS`, so the first request returns the
+Reasoning models are slow enough to matter here. AutoSub uses verified 120-cue
+batches and runs up to twelve at once by default. The private Codex gateway was
+benchmarked at 95 successful requests per minute with twelve truly overlapping
+executions, so a typical film can be submitted in one or two waves. Other
+endpoints may support less: 429 backpressure automatically halves the active
+worker count and remembers the working limit without discarding completed paid
+batches. A long translation may still exceed `JOB_WAIT_MS`, so the first
+request returns the
 "still preparing" notice and the subtitle appears when the row is selected
 again. Set `TRANSLATION_CONCURRENCY` to what the endpoint allows (1–12).
 
