@@ -64,21 +64,60 @@ describe("audio alignment", () => {
     expect(result.cues[180].startMs).toBeCloseTo((cues[180].startMs * rate) + offset, -2);
   });
 
-  it("rejects an extreme correction that would crush early cues to zero", () => {
-    const cues: SubtitleCue[] = Array.from({ length: 100 }, (_, index) => ({
-      id: index + 1,
-      startMs: 5_000 + index * 4_000,
-      endMs: 6_200 + index * 4_000,
-      text: "x",
-    }));
-    const windows: VadWindow[] = [30_000, 90_000, 150_000, 210_000].map((startMs) => ({
+  it("rejects a correction that would crush early cues to zero", () => {
+    // The speech only matches cues from the fourth minute onward, so the sole
+    // good mapping drags the opening of the subtitle behind the start of the
+    // film. A subtitle that has to be mutilated to fit is not a match.
+    let cursor = 5_000;
+    const cues: SubtitleCue[] = Array.from({ length: 200 }, (_, index) => {
+      cursor += 1_700 + ((index * 1_531) % 4_900);
+      return { id: index + 1, startMs: cursor, endMs: cursor + 1_400, text: `line${index}` };
+    });
+    const shift = -170_000;
+    const starts = [30_000, 90_000, 150_000, 210_000];
+    const windows: VadWindow[] = starts.map((startMs) => ({
       startMs,
       durationMs: 15_000,
-      speech: [{ startMs: 1_000, endMs: 8_000 }, { startMs: 9_000, endMs: 14_000 }],
+      speech: cues.flatMap((cue) => {
+        const from = cue.startMs + shift - startMs;
+        const to = cue.endMs + shift - startMs;
+        return to > 0 && from < 15_000 ? [{ startMs: Math.max(0, from), endMs: Math.min(15_000, to) }] : [];
+      }),
     }));
+
     const result = alignSubtitle(cues, windows, 180_000);
     expect(result.confidence).toBe(0);
     expect(result.cues[0].startMs).toBe(cues[0].startMs);
+  });
+
+  it("prefers leaving a subtitle alone over an equally plausible mangling", () => {
+    // Four sampled windows cover about a minute of a two-hour film, which
+    // leaves the rate badly under-determined: compressing time by four per cent
+    // and shifting two minutes earlier can fit those windows as well as doing
+    // nothing. Given the choice, the smaller correction is the honest one.
+    let cursor = 20_000;
+    const cues: SubtitleCue[] = Array.from({ length: 400 }, (_, index) => {
+      cursor += 1_600 + ((index * 1_237) % 4_800);
+      return { id: index + 1, startMs: cursor, endMs: cursor + 1_500, text: `line${index}` };
+    });
+    // Windows spread across the subtitle, covering a minute of the whole.
+    const starts = [60_000, 500_000, 1_000_000, 1_500_000];
+    const windows: VadWindow[] = starts.map((startMs) => ({
+      startMs,
+      durationMs: 15_000,
+      speech: cues.flatMap((cue) => {
+        const from = cue.startMs - startMs;
+        const to = cue.endMs - startMs;
+        return to > 0 && from < 15_000 ? [{ startMs: Math.max(0, from), endMs: Math.min(15_000, to) }] : [];
+      }),
+    }));
+
+    const result = alignSubtitle(cues, windows, 180_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(Math.abs(result.offsetMs)).toBeLessThan(1_000);
+    expect(result.rate).toBeCloseTo(1, 3);
+    // The whole point: no cue is dragged minutes away from where it belongs.
+    expect(Math.abs(result.cues[380].startMs - cues[380].startMs)).toBeLessThan(1_000);
   });
 
   it("lands on the speech even though cue spans are padded around it", () => {

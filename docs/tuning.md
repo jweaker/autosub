@@ -45,6 +45,21 @@ skipped entirely when the evidence disagrees by less than 250 ms — inside
 subtitling convention and below what a viewer notices — and is capped, so it
 can polish a mapping but never re-align the title.
 
+### Why the smallest correction wins a tie
+
+Four sampled windows cover about a minute of a two-hour film, which leaves the
+rate badly under-determined. Compressing time by four per cent and shifting two
+minutes earlier can fit that minute of evidence exactly as well as leaving the
+subtitle alone — and the second mapping is right far more often than the first.
+
+So the coarse sweep does not simply take the highest score. Among placements the
+evidence cannot separate (within 3%), it takes the one that moves the subtitle
+least, measured as `|offset| + |rate - 1| x span`. A genuine frame-rate
+conversion still wins, because it scores far better than leaving the subtitle
+alone, not merely a little better. The fine sweep applies no such preference:
+it is locating the optimum inside an alignment already chosen, where preferring
+smaller numbers would just bias every result toward zero.
+
 Only global corrections are applied: `newTime = oldTime × rate + offset`. The coarse sweep covers the frame-rate ratios that cause real drift (23.976↔25, 24↔25, 29.97↔30) plus small clock errors; the fine sweep refines to 50 ms and 0.01%. Per-cue nudging is deliberately not implemented — it can make a mismatched subtitle *look* aligned at every sampled point while being wrong everywhere else.
 
 ## Settings

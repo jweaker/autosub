@@ -15,6 +15,17 @@ interface MappingScore {
   windowScores: number[];
 }
 
+/**
+ * How close two scores must be before the tie is settled on other grounds.
+ * Sampled windows cover a minute or so of a two-hour film, which leaves the
+ * rate badly under-determined: compressing time by four per cent and shifting
+ * two minutes earlier can fit the same handful of windows as leaving the
+ * subtitle alone. When the evidence cannot tell them apart, the smaller
+ * correction is the honest answer.
+ */
+const TIE_MARGIN = 0.03;
+const TIE_FLOOR = 0.01;
+
 interface FineSearch {
   rateSpan: number;
   rateStep: number;
@@ -108,6 +119,11 @@ class CueIndex {
     }
     this.order = order;
     this.maxDurationMs = maxDuration;
+  }
+
+  /** How much of the title the subtitle covers, used to price a rate change. */
+  get spanMs(): number {
+    return this.count ? this.ends[this.count - 1] - this.starts[0] : 0;
   }
 
   /** First index whose cue may end at or after `fromMs`. */
@@ -228,37 +244,78 @@ function evaluateMapping(
  * coarse distribution, which is what separates a real match from a subtitle
  * that scores mediocre everywhere.
  */
+interface Placement {
+  offsetMs: number;
+  rate: number;
+  score: number;
+}
+
+/** How far a mapping moves the subtitle, in milliseconds of displacement. */
+function displacement(placement: Placement, spanMs: number): number {
+  return Math.abs(placement.offsetMs) + (Math.abs(placement.rate - 1) * spanMs);
+}
+
+/**
+ * The best-scoring placement, or the least invasive one among those the
+ * evidence cannot separate from it.
+ *
+ * Order-independent by construction: taking the first maximum encountered
+ * silently preferred whatever the loops happened to visit first, which meant
+ * the largest negative offset at the lowest rate.
+ */
+function select(placements: Placement[], spanMs: number, margin: number): Placement | undefined {
+  let bestScore = Number.NEGATIVE_INFINITY;
+  for (const placement of placements) if (placement.score > bestScore) bestScore = placement.score;
+  if (!Number.isFinite(bestScore)) return undefined;
+  const threshold = margin > 0 ? bestScore - Math.max(TIE_FLOOR, bestScore * margin) : bestScore;
+
+  let chosen: Placement | undefined;
+  let chosenCost = Number.POSITIVE_INFINITY;
+  for (const placement of placements) {
+    if (placement.score < threshold) continue;
+    const cost = displacement(placement, spanMs);
+    if (cost < chosenCost) {
+      chosen = placement;
+      chosenCost = cost;
+    }
+  }
+  return chosen;
+}
+
 function searchMapping(
   evaluator: (offsetMs: number, rate: number) => MappingScore,
   maxOffsetMs: number,
   fine: FineSearch,
+  spanMs: number,
 ): { best?: MappingScore; distinctiveness: number } {
-  const distribution: number[] = [];
-  let coarseBest: MappingScore | undefined;
+  const coarse: Placement[] = [];
   for (const rate of COMMON_RATES) {
     for (let offsetMs = -maxOffsetMs; offsetMs <= maxOffsetMs; offsetMs += COARSE_OFFSET_STEP_MS) {
-      const mapping = evaluator(offsetMs, rate);
-      distribution.push(mapping.score);
-      if (!coarseBest || mapping.score > coarseBest.score) coarseBest = mapping;
+      const { score } = evaluator(offsetMs, rate);
+      coarse.push({ offsetMs, rate, score });
     }
   }
+  // Parsimony belongs to the coarse sweep, which decides *which* alignment is
+  // being claimed. The fine sweep only locates the optimum inside the winner,
+  // where preferring smaller numbers would just bias every result toward zero.
+  const coarseBest = select(coarse, spanMs, TIE_MARGIN);
   if (!coarseBest) return { distinctiveness: 0 };
 
-  let best = coarseBest;
+  const refined: Placement[] = [];
   const minimumRate = Math.max(0.94, coarseBest.rate - fine.rateSpan);
   const maximumRate = Math.min(1.06, coarseBest.rate + fine.rateSpan);
   const minimumOffset = Math.max(-maxOffsetMs, coarseBest.offsetMs - fine.offsetSpan);
   const maximumOffset = Math.min(maxOffsetMs, coarseBest.offsetMs + fine.offsetSpan);
-  let first = true;
   for (let rate = minimumRate; rate <= maximumRate + 0.00001; rate += fine.rateStep) {
     for (let offsetMs = minimumOffset; offsetMs <= maximumOffset; offsetMs += FINE_OFFSET_STEP_MS) {
-      const mapping = evaluator(offsetMs, rate);
-      if (first || mapping.score > best.score) best = mapping;
-      first = false;
+      const { score } = evaluator(offsetMs, rate);
+      refined.push({ offsetMs, rate, score });
     }
   }
+  const chosen = select(refined, spanMs, 0) || coarseBest;
+  const best = evaluator(chosen.offsetMs, chosen.rate);
 
-  distribution.sort((left, right) => left - right);
+  const distribution = coarse.map((placement) => placement.score).sort((left, right) => left - right);
   const baseline = distribution[Math.floor(distribution.length * 0.75)] || 0;
   return { best, distinctiveness: Math.max(0, best.score - baseline) };
 }
@@ -425,7 +482,7 @@ export function alignSubtitle(cues: SubtitleCue[], windows: VadWindow[], maxOffs
   const index = cueIndexFor(cues);
   const states = windowIndexFor(windows);
   const evaluate = (offsetMs: number, rate: number): MappingScore => evaluateMapping(index, windows, states, offsetMs, rate);
-  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, ACTIVITY_FINE);
+  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, ACTIVITY_FINE, index.spanMs);
   if (!found || rejected(index, found, maxOffsetMs, distinctiveness)) return unaligned(cues);
   const best = shifted(found, speechShift(index, windows, states, found), evaluate);
 
@@ -518,7 +575,7 @@ export function alignSubtitleToTranscript(cues: SubtitleCue[], windows: VadWindo
   const index = cueIndexFor(cues);
   const states = windowIndexFor(windows);
   const evaluate = (offsetMs: number, rate: number): MappingScore => transcriptMappingScore(index, windows, states, offsetMs, rate);
-  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, PRECISE_FINE);
+  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, PRECISE_FINE, index.spanMs);
   if (!found) return unaligned(cues);
   // The search says which subtitle fits; the speech onsets say exactly where.
   const best = shifted(found, speechShift(index, windows, states, found), evaluate);
@@ -543,6 +600,10 @@ class EventIndex {
 
   constructor(cues: SubtitleCue[]) {
     this.starts = Float64Array.from(cues, (cue) => cue.startMs).sort();
+  }
+
+  get spanMs(): number {
+    return this.starts.length ? this.starts[this.starts.length - 1] - this.starts[0] : 0;
   }
 }
 
@@ -648,7 +709,7 @@ export function alignSubtitleToReference(target: SubtitleCue[], reference: Subti
   const targetIndex = eventIndexFor(target);
   const referenceIndex = eventIndexFor(reference);
   const evaluate = (offsetMs: number, rate: number): MappingScore => eventSequenceScore(targetIndex, referenceIndex, offsetMs, rate);
-  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, PRECISE_FINE);
+  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, PRECISE_FINE, targetIndex.spanMs);
   if (!found) return unaligned(target);
   const best = shifted(found, referenceShift(targetIndex, referenceIndex, found), evaluate);
   const strong = best.windowScores.filter((score) => score >= 0.42).length;
