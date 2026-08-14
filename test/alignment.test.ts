@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript } from "../src/alignment.js";
+import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, speechOffsetError } from "../src/alignment.js";
 import type { SubtitleCue, VadWindow } from "../src/domain.js";
 
 describe("audio alignment", () => {
@@ -269,5 +269,34 @@ describe("audio alignment", () => {
     const result = alignSubtitleToReference(target, reference, 10_000);
     expect(result.confidence).toBeGreaterThanOrEqual(58);
     expect(Math.abs(result.cues[180].startMs - reference[180].startMs)).toBeLessThan(75);
+  });
+
+  it("measures how far a finished subtitle sits from the speech", () => {
+    // The last line of defence: whatever route produced a subtitle, this asks
+    // the audio directly whether it landed on the dialogue.
+    const cues: SubtitleCue[] = Array.from({ length: 150 }, (_, index) => ({
+      id: index + 1,
+      startMs: 15_000 + index * 6_000,
+      endMs: 15_000 + index * 6_000 + 2_500,
+      text: `line${index}`,
+    }));
+    const speechFor = (displacementMs: number) => [30_000, 300_000, 600_000, 800_000].map((startMs) => ({
+      startMs,
+      durationMs: 20_000,
+      speech: cues.flatMap((cue) => {
+        const from = cue.startMs + displacementMs - startMs + 200;
+        const to = cue.endMs + displacementMs - startMs;
+        return to > 0 && from < 20_000 ? [{ startMs: Math.max(0, from), endMs: Math.min(20_000, to) }] : [];
+      }),
+    }));
+
+    // Sitting on the speech: within the lead a subtitle is meant to have.
+    expect(Math.abs(speechOffsetError(cues, speechFor(0)) as number)).toBeLessThan(200);
+    // Speech arriving two seconds after the cue: the subtitle is early.
+    expect(speechOffsetError(cues, speechFor(2_000)) as number).toBeGreaterThan(1_500);
+    // And the other way round.
+    expect(speechOffsetError(cues, speechFor(-2_000)) as number).toBeLessThan(-1_500);
+    // Nothing to measure against.
+    expect(speechOffsetError(cues, [])).toBeUndefined();
   });
 });

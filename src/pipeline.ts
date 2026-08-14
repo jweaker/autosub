@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript } from "./alignment.js";
+import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, speechOffsetError } from "./alignment.js";
 import { AudioAnalyzer } from "./audio.js";
 import { stableKey, SubtitleCache } from "./cache.js";
 import type { AppConfig } from "./config.js";
@@ -20,6 +20,14 @@ const MAX_CACHED_PROBES = 12;
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 const CANDIDATES_PER_WAVE = 3;
 const MAX_SOURCE_ATTEMPTS = 3;
+/**
+ * How far a finished subtitle may sit from the speech before it is refused.
+ *
+ * Generous, because it is a last line of defence rather than a matching
+ * criterion: a subtitle a second and a half from the dialogue is wrong no
+ * matter which route produced it or how confident that route was.
+ */
+const SPEECH_ERROR_LIMIT_MS = 1_200;
 const DOWNLOAD_REUSE_MS = 60_000;
 const MAX_TRACKED_RUNS = 25;
 
@@ -38,6 +46,8 @@ export interface RunSummary {
   stages: Record<string, number>;
   /** Present only for translated runs, so their cost is visible in /stats. */
   translation?: { cues: number; characters: number; promptTokens?: number; responseTokens?: number };
+  /** How far the delivered subtitle sits from the speech, measured on the audio. */
+  speechErrorMs?: number;
 }
 
 /** Raised instead of translating when the viewer has not asked to pay for it. */
@@ -74,6 +84,7 @@ export class AutoSubPipeline {
   private readonly cache: SubtitleCache;
   private readonly byName: Map<string, SubtitleProvider>;
   private readonly downloads = new Map<string, Promise<Uint8Array>>();
+  private lastSpeechError?: number;
   private readonly probes = new Map<string, { probe: Promise<AudioProbeResult>; at: number }>();
   private readonly runs: RunSummary[] = [];
   private readonly runsPath: string;
@@ -336,6 +347,22 @@ export class AutoSubPipeline {
     });
   }
 
+  /**
+   * Final check against the audio itself, after every other decision is made.
+   *
+   * Each route reasons about a different kind of evidence, and each can be
+   * wrong in its own way; this asks the one question none of them ask directly,
+   * which is whether the finished subtitle lands on the speech.
+   */
+  private landsOnSpeech(content: string, probe: AudioProbeResult, label: string): boolean {
+    const error = speechOffsetError(parseSrt(content), probe.windows);
+    this.lastSpeechError = error;
+    if (error === undefined) return true;
+    if (Math.abs(error) <= SPEECH_ERROR_LIMIT_MS) return true;
+    console.warn(`Refusing ${label}: it sits ${error}ms from the speech in the sampled audio`);
+    return false;
+  }
+
   private async store(result: CompletedSubtitle): Promise<CompletedSubtitle> {
     try {
       await this.cache.put(result);
@@ -388,6 +415,7 @@ export class AutoSubPipeline {
       stages,
       translation,
       route,
+      speechErrorMs: route ? this.lastSpeechError : undefined,
     });
 
     const cached = await this.cache.get(key);
@@ -443,7 +471,7 @@ export class AutoSubPipeline {
       if (!source) break;
       log("Trusted timing", source, probe, started, stages);
 
-      if (sourceLanguages.includes(target)) {
+      if (sourceLanguages.includes(target) && this.landsOnSpeech(source.content, probe, `${source.ranked.candidate.provider}:${source.ranked.candidate.providerId}`)) {
         const result = await this.store({
           key,
           id: variantId(source.ranked.candidate),
@@ -464,7 +492,7 @@ export class AutoSubPipeline {
         (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
         excluded,
       ));
-      if (direct) {
+      if (direct && this.landsOnSpeech(direct.content, probe, `${direct.ranked.candidate.provider}:${direct.ranked.candidate.providerId}`)) {
         log(`Direct ${target} subtitle`, direct, probe, started, stages);
         const result = await this.store({
           key,
@@ -490,7 +518,7 @@ export class AutoSubPipeline {
     // is what matters for a film whose original language has a handful of
     // subtitles but whose English catalogue has hundreds.
     const fallback = await this.matchWithoutSpokenSource(request, probe, targetCandidates, excluded, sourceLanguages, target, mark, rejectedSources.size > excluded.size);
-    if (fallback) {
+    if (fallback && this.landsOnSpeech(fallback.subtitle.content, probe, fallback.subtitle.id)) {
       const result = await this.store({ key, ...fallback.subtitle });
       log(`Fallback ${target} subtitle`, fallback.evaluated, probe, started, stages);
       summary("direct", result, undefined, fallback.route);

@@ -61,6 +61,7 @@ const MINIMUM_REFERENCE_PAIRS = 15;
 const ONSET_MERGE_GAP_MS = 400;
 const ONSET_SEARCH_MS = 1_200;
 const ONSET_EDGE_MS = 150;
+const MEASURE_SEARCH_MS = 4_000;
 const WORD_SEARCH_MS = 1_500;
 const PRECISE_FINE: FineSearch = { rateSpan: 0.0015, rateStep: FINE_RATE_STEP, offsetSpan: 1_500 };
 
@@ -400,8 +401,25 @@ function wordAnchors(cues: CueIndex, windows: VadWindow[], states: WindowIndex[]
   return [...earliest].map(([cue, absoluteMs]) => absoluteMs - ((cues.starts[cue] * rate) + offsetMs));
 }
 
+/**
+ * How far a finished subtitle sits from the speech it captions, in
+ * milliseconds, positive when the speech comes after the cue appears.
+ *
+ * This is the only ground truth available that is not another subtitle file:
+ * the audio of the release being played. A well-timed track sits a fraction of
+ * a second ahead of its speech; anything else has gone wrong somewhere in the
+ * chain, however confident the match that produced it.
+ */
+export function speechOffsetError(cues: SubtitleCue[], windows: VadWindow[]): number | undefined {
+  if (!cues.length || !windows.length) return undefined;
+  // A wider radius than the refinement uses, because the errors worth catching
+  // here are exactly the ones too large for refinement to consider.
+  const residuals = onsetAnchors(cueIndexFor(cues), windows, 0, 1, MEASURE_SEARCH_MS);
+  return residuals.length >= MINIMUM_REFINE_PAIRS ? Math.round(median(residuals) - ONSET_LEAD_MS) : undefined;
+}
+
 /** Same idea from speech activity alone, for when nothing was transcribed. */
-function onsetAnchors(cues: CueIndex, windows: VadWindow[], offsetMs: number, rate: number): number[] {
+function onsetAnchors(cues: CueIndex, windows: VadWindow[], offsetMs: number, rate: number, searchMs = ONSET_SEARCH_MS): number[] {
   const residuals: number[] = [];
   for (const window of windows) {
     const onsets = onsetsFor(window);
@@ -417,7 +435,7 @@ function onsetAnchors(cues: CueIndex, windows: VadWindow[], offsetMs: number, ra
       for (const onset of onsets) {
         if (Math.abs(onset - mapped) < Math.abs(nearest)) nearest = onset - mapped;
       }
-      if (Math.abs(nearest) <= ONSET_SEARCH_MS) residuals.push(nearest);
+      if (Math.abs(nearest) <= searchMs) residuals.push(nearest);
     }
   }
   return residuals;

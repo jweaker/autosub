@@ -58,7 +58,7 @@ curl -fsS "$PUBLIC_URL/$INSTALL_TOKEN/stats" | jq '.runs[0]'
 }
 ```
 
-Translated runs also carry a `translation` block with the cue count and the tokens the model actually charged for, which is the only honest way to know what a title cost. `audio` almost always dominates a cold run, and it is bandwidth, not CPU: sampling reads the interleaved container, so the cost scales with the release's bitrate. `AUDIO_BUDGET_MB` caps it. `outcome` is `cached`, `direct`, `translated` or `failed`.
+Every delivered run carries `speechErrorMs`: how far the finished subtitle sits from the speech in the sampled audio, measured after every other decision was made. A well-timed track is within a couple of hundred milliseconds; anything past 1200 ms is refused outright, whichever route produced it. Translated runs also carry a `translation` block with the cue count and the tokens the model actually charged for, which is the only honest way to know what a title cost. `audio` almost always dominates a cold run, and it is bandwidth, not CPU: sampling reads the interleaved container, so the cost scales with the release's bitrate. `AUDIO_BUDGET_MB` caps it. `outcome` is `cached`, `direct`, `translated` or `failed`.
 
 ## Status codes
 
