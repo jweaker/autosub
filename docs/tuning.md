@@ -45,20 +45,22 @@ skipped entirely when the evidence disagrees by less than 250 ms — inside
 subtitling convention and below what a viewer notices — and is capped, so it
 can polish a mapping but never re-align the title.
 
-### Why the smallest correction wins a tie
+### Why a rate change has to pay for itself
 
-Four sampled windows cover about a minute of a two-hour film, which leaves the
-rate badly under-determined. Compressing time by four per cent and shifting two
-minutes earlier can fit that minute of evidence exactly as well as leaving the
-subtitle alone — and the second mapping is right far more often than the first.
+Four sampled windows cover about a minute of a two-hour film. That pins the
+offset well and the rate barely at all: a shift moves every cue in every window,
+while a four per cent stretch only moves cues *between* windows, where a dense
+subtitle always has another cue to offer. Left to the raw score, the search
+invents frame-rate conversions — and invents different ones on different runs of
+the same title, which is what "in sync at the start, seconds out by the end"
+looks like.
 
-So the coarse sweep does not simply take the highest score. Among placements the
-evidence cannot separate (within 3%), it takes the one that moves the subtitle
-least, measured as `|offset| + |rate - 1| x span`. A genuine frame-rate
-conversion still wins, because it scores far better than leaving the subtitle
-alone, not merely a little better. The fine sweep applies no such preference:
-it is locating the optimum inside an alignment already chosen, where preferring
-smaller numbers would just bias every result toward zero.
+So a rate deviation is charged against the score it earns, at three points of
+score per unit of rate. A real conversion pays that easily, because at the wrong
+rate a subtitle is tens of seconds out by the far end of the film. A guess that
+merely fits a minute of sampled audio does not. Exact ties then go to the
+smaller shift, so the answer never depends on which placement the search
+happened to visit first.
 
 Only global corrections are applied: `newTime = oldTime × rate + offset`. The coarse sweep covers the frame-rate ratios that cause real drift (23.976↔25, 24↔25, 29.97↔30) plus small clock errors; the fine sweep refines to 50 ms and 0.01%. Per-cue nudging is deliberately not implemented — it can make a mismatched subtitle *look* aligned at every sampled point while being wrong everywhere else.
 

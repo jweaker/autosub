@@ -120,6 +120,34 @@ describe("audio alignment", () => {
     expect(Math.abs(result.cues[380].startMs - cues[380].startMs)).toBeLessThan(1_000);
   });
 
+  it("gives the same answer twice for the same title", () => {
+    // The failure that prompted this: two runs of one film produced opposite
+    // four per cent warps. A mapping the evidence does not pin down must not be
+    // decided by whichever placement the loops happened to visit first.
+    let cursor = 30_000;
+    const cues: SubtitleCue[] = Array.from({ length: 500 }, (_, index) => {
+      cursor += 1_500 + ((index * 977) % 5_100);
+      return { id: index + 1, startMs: cursor, endMs: cursor + 1_600, text: `line${index}` };
+    });
+    const build = (starts: number[]): VadWindow[] => starts.map((startMs) => ({
+      startMs,
+      durationMs: 15_000,
+      speech: cues.flatMap((cue) => {
+        const from = cue.startMs + 2_000 - startMs;
+        const to = cue.endMs + 2_000 - startMs;
+        return to > 0 && from < 15_000 ? [{ startMs: Math.max(0, from), endMs: Math.min(15_000, to) }] : [];
+      }),
+    }));
+
+    // Different sampling of the same film, as two cold runs would produce.
+    const first = alignSubtitle(cues, build([80_000, 600_000, 1_100_000, 1_600_000]), 180_000);
+    const second = alignSubtitle(cues, build([120_000, 640_000, 1_140_000, 1_640_000]), 180_000);
+    expect(first.confidence).toBeGreaterThanOrEqual(58);
+    expect(second.confidence).toBeGreaterThanOrEqual(58);
+    expect(first.rate).toBeCloseTo(second.rate as number, 3);
+    expect(Math.abs(first.offsetMs - second.offsetMs)).toBeLessThan(500);
+  });
+
   it("lands on the speech even though cue spans are padded around it", () => {
     // A cue appears before its line and lingers after it, so overlap scoring is
     // flat across that padding. Without a sharper anchor the search settles
