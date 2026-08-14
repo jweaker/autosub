@@ -261,6 +261,23 @@ describe("addon HTTP surface", () => {
     expect((await fetch(local(normal.url))).headers.get("x-autosub-translated")).toBe("false");
   });
 
+  it("keeps selector ids stable when a failed job is recreated", async () => {
+    await start(async () => {
+      throw new Error("No subtitle in en matched the transcribed audio");
+    }, { GEMINI_API_KEY: "k", STATUS_PROBE_MS: "100" });
+    await playStream();
+
+    const first = await listSubtitles();
+    const second = await listSubtitles();
+    expect(second.map((entry) => entry.id)).toEqual(first.map((entry) => entry.id));
+
+    // The failed job itself was replaced, so its live URLs must change even
+    // though Stremio's selector identities do not.
+    expect(second.map((entry) => entry.url)).not.toEqual(first.map((entry) => entry.url));
+    expect(first.filter((entry) => entry.lang.includes("force AI"))).toHaveLength(1);
+    expect(second.filter((entry) => entry.lang.includes("force AI"))).toHaveLength(1);
+  });
+
   it("hides the translation row when no model is configured", async () => {
     await start(async () => subtitle());
     await playStream();

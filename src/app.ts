@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import type { SubtitleCache } from "./cache.js";
+import { stableKey, type SubtitleCache } from "./cache.js";
 import { translationConfigured, type AppConfig } from "./config.js";
 import { renderDashboard } from "./dashboard.js";
 import type { CompletedSubtitle, StreamRecord, SubtitleProvider, SubtitleRequest } from "./domain.js";
@@ -47,7 +47,7 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.17.0",
+  version: "1.17.1",
   name: "AutoSub",
   description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback and override",
   resources: [
@@ -255,6 +255,22 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
   const fileUrl = (path: string): string => `${config.publicUrl}/${config.installToken}/${path}`;
 
   /**
+   * Stremio treats a changed subtitle id as another variant, even when its
+   * language and purpose are identical. Job ids are intentionally ephemeral,
+   * so exposing them here left a stale duplicate after an AutoSub restart.
+   * Keep the selector identity stable for this title/language/action; only the
+   * URL needs to follow the current live job.
+   */
+  const entryId = (request: SubtitleRequest, language: string, action: string): string =>
+    `autosub-${action}-${stableKey({
+      version: 1,
+      type: request.type,
+      contentId: request.contentId,
+      language,
+      action,
+    }).slice(0, 24)}`;
+
+  /**
    * Builds the menu for one language.
    *
    * The first entry keeps the plain ISO code so Stremio's "preferred subtitle
@@ -269,7 +285,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
   async function entriesFor(request: SubtitleRequest, stream: StreamRecord, language: string): Promise<SubtitleEntry[]> {
     const jobId = await jobs.startTracked(request, stream, language);
     const entries: SubtitleEntry[] = [{
-      id: `autosub-${jobId}`,
+      id: entryId(request, language, "main"),
       url: fileUrl(`file/${jobId}.srt`),
       lang: stremioLanguage(language),
     }];
@@ -279,10 +295,10 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     // or cached play) and the always-valid "try another" action.
     const snapshot = await jobs.snapshot(jobId, config.statusProbeMs);
     if (snapshot?.state === "ready") {
-      entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: resultLabel(snapshot.result) });
+      entries.push({ id: entryId(request, language, "status"), url: fileUrl(`file/${jobId}.srt`), lang: resultLabel(snapshot.result) });
     } else if (snapshot?.state === "failed") {
       entries.push({
-        id: `autosub-status-${jobId}`,
+        id: entryId(request, language, "status"),
         url: fileUrl(`file/${jobId}.srt`),
         lang: failedLabel(snapshot.error instanceof TranslationRequiredError && config.translationMode === "manual" && translationConfigured(config)),
       });
@@ -292,7 +308,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     // means the same thing — "not this one, give me the next".
     for (let attempt = 1; attempt <= config.retryEntries; attempt += 1) {
       entries.push({
-        id: `autosub-next-${jobId}-${attempt}`,
+        id: entryId(request, language, `next-${attempt}`),
         url: fileUrl(`next/${jobId}/${attempt}.srt`),
         lang: retryLabel(language, attempt),
       });
@@ -301,7 +317,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     // choice rather than something that happens on the viewer's behalf.
     if (config.translationMode === "manual" && translationConfigured(config)) {
       entries.push({
-        id: `autosub-translate-${jobId}`,
+        id: entryId(request, language, "translate"),
         url: fileUrl(`translate/${jobId}.srt`),
         lang: translateLabel(language),
       });

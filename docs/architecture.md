@@ -63,6 +63,11 @@ GET /:token/next/:jobId[/:attempt].srt
     └─ the replacement subtitle
 ```
 
+Subtitle selector ids are stable for a media item, target language, and action.
+The delivery URL still contains the current ephemeral job id. This distinction
+lets Stremio replace refreshed rows after a restart instead of displaying the
+same force/retry action as another subtitle variant.
+
 The attempt number carries no meaning beyond making each retry row a distinct
 URL: players do not re-request a track they have already loaded, so a single
 shared URL could only be used once per playback.
