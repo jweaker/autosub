@@ -59,6 +59,7 @@ async function start(complete: AutoSubPipeline["complete"], environment: Record<
     upstream: new UpstreamStreamAddon(undefined, registry),
     jobs,
     providers: [],
+    pipeline: { recentRuns: () => [] },
   });
   server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
@@ -105,7 +106,7 @@ describe("addon HTTP surface", () => {
     expect(subtitles[0].lang).toBe("ara");
     expect(subtitles[1].lang).toContain("found on opensubtitles");
     expect(subtitles[1].lang).toContain("81%");
-    expect(subtitles[2].lang).toContain("try another");
+    expect(subtitles[2].lang).toBe("Arabic - try another (AutoSub)");
     expect(subtitles[2].url).toContain("/next/");
   });
 
@@ -116,11 +117,24 @@ describe("addon HTTP surface", () => {
     expect(subtitles[1].lang).toContain("AI translated from English");
   });
 
-  it("reports preparing while the pipeline is still running", async () => {
+  it("shows no status row while work is still running", async () => {
+    // The player fetches this list once, so a "preparing" row written now would
+    // still claim to be preparing long after the subtitle arrived.
     await start(() => new Promise<CompletedSubtitle>(() => undefined), { STATUS_PROBE_MS: "50" });
     await playStream();
     const subtitles = await listSubtitles();
-    expect(subtitles[1].lang).toContain("preparing");
+    expect(subtitles).toHaveLength(2);
+    expect(subtitles[0].lang).toBe("ara");
+    expect(subtitles[1].lang).toBe("Arabic - try another (AutoSub)");
+  });
+
+  it("shows why nothing arrived when preparation already failed", async () => {
+    await start(async () => {
+      throw new Error("No subtitle in en matched the transcribed audio");
+    }, { STATUS_PROBE_MS: "500" });
+    await playStream();
+    const subtitles = await listSubtitles();
+    expect(subtitles[1].lang).toBe("AutoSub: nothing matched this release");
   });
 
   it("delivers the subtitle with a banner describing its origin", async () => {
@@ -212,6 +226,14 @@ describe("addon HTTP surface", () => {
     const response = await fetch(`${base}/${TOKEN}/file/unknown-job.srt`);
     expect(response.headers.get("x-autosub-state")).toBe("expired");
     expect(await response.text()).toContain("no longer active");
+  });
+
+  it("reports recent runs behind the token", async () => {
+    await start(async () => subtitle());
+    expect((await fetch(`${base}/wrong/stats`)).status).toBe(404);
+    const response = await fetch(`${base}/${TOKEN}/stats`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ runs: [] });
   });
 
   it("returns an empty list when no stream has been opened", async () => {

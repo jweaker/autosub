@@ -39,6 +39,7 @@ Only global corrections are applied: `newTime = oldTime × rate + offset`. The c
 | `AUDIO_SAMPLE_COUNT` | `4` | Windows sampled across the title. More windows means stronger coverage and more bandwidth. |
 | `AUDIO_SAMPLE_SECONDS` | `15` | Length of each window. |
 | `AUDIO_CONCURRENCY` | `4` | Samples fetched at once. Remote range seeks dominate cold-start latency. |
+| `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one analysis may download. The main cold-run speed control. |
 | `REFERENCE_LANGUAGES` | *(empty)* | Extra languages allowed to serve as the trusted timing track. |
 
 Change one thing at a time and re-test against several real releases. `npm run smoke -- tt1234567` prints the provider, confidence, cue count and first timestamps for a live run.
@@ -53,4 +54,6 @@ Change one thing at a time and re-test against several real releases. `npm run s
 
 **A delivered subtitle is wrong even though it passed.** Pick "AutoSub: try another" in the subtitle menu. That records the file as rejected for this release forever and prepares the next best candidate, reusing the audio analysis. If it happens repeatedly on titles of the same kind, raise `MINIMUM_CONFIDENCE`; the rejections tell you where the current threshold is too generous.
 
-**Cold runs are slow.** Audio sampling dominates, and it is bounded by the debrid host's seek latency. Reduce `AUDIO_SAMPLE_SECONDS` or `AUDIO_SAMPLE_COUNT` before touching anything else; both weaken coverage, so watch for false matches afterwards.
+**Cold runs are slow.** Check `/stats` first — `audio` almost always dominates, and it is bandwidth rather than CPU. Sampling reads the interleaved container, not just the audio track, so a window costs `bitrate x seconds` regardless of how little audio is in it: fifteen seconds of a 100 Mbit remux is ~190 MB, the same fifteen seconds of an 8 Mbit web release is ~15 MB.
+
+`AUDIO_BUDGET_MB` (default 240) caps the total. Windows are shortened automatically to fit it, never below 8s, so heavy releases pay in coverage instead of in minutes. Lowering it to 120 roughly halves the download on those releases; raising it favours validation strength. `AUDIO_SAMPLE_COUNT` and `AUDIO_SAMPLE_SECONDS` remain the upper bounds for ordinary releases.

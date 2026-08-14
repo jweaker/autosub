@@ -36,12 +36,13 @@ Stremio gives an addon no way to show a spinner, so AutoSub reports itself throu
 | In the subtitle menu | Meaning |
 |---|---|
 | `Arabic` | The normal entry. Your preferred-language setting still auto-selects it. |
-| `AutoSub: preparing Arabic...` | Still searching and validating. Reopen the menu shortly. |
-| `AutoSub: found on opensubtitles (81%)` | A real subtitle was found and validated at that confidence. |
-| `AutoSub: AI translated from English (74%)` | Nothing matched directly, so the validated English timing was translated. |
-| `AutoSub: try another Arabic subtitle` | Select this if the subtitle is wrong. |
+| `Arabic - try another (AutoSub)` | Select this if the subtitle is wrong. |
+| `AutoSub: found on opensubtitles (81%)` | Shown on a warm play, when the answer is already known. |
+| `AutoSub: AI translated from English (74%)` | Same, for a translated result. |
 
-While playing, the delivered subtitle opens with one short line naming its origin — `[AutoSub] opensubtitles subtitle - 81% match` — which disappears after a few seconds. If preparation is still running or nothing passed validation, you get a readable message on screen instead of silence.
+The protocol gives an addon three fields per row — `id`, `url`, `lang` — and the player renders `lang`. So anything extra has to look like a language, which is why there is only one always-present extra row, and why **progress is never shown there**: the list is fetched once, when playback starts, so a "preparing" label written then would still say "preparing" an hour later.
+
+Progress lives in the subtitle instead, which is generated when it is requested and so is always current. The delivered file opens with one short line naming its origin — `[AutoSub] opensubtitles subtitle - 81% match` — that clears after a few seconds. If preparation is still running past `JOB_WAIT_MS`, or nothing passed validation, you get a readable message on screen instead of silence.
 
 **"Try another" marks the current subtitle as bad**, remembers that permanently for this release, and prepares the next best candidate. The rejection survives restarts, so the same file is never handed back, and the audio analysis is reused, which makes a second attempt take seconds rather than another full run. Selecting it again moves to the one after that; when nothing is left, it says so.
 
@@ -129,7 +130,8 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `CANDIDATE_LIMIT` | `10` | Candidates downloaded and validated per language |
 | `JOB_WAIT_MS` | `120000` | How long a subtitle request waits for preparation |
 | `CACHE_TTL_DAYS` | `30` | Age at which cached subtitles are swept |
-| `MENU_ENTRIES` | `true` | Add status and "try another" entries to the subtitle menu |
+| `MENU_ENTRIES` | `true` | Add the "try another" row, and a result row on warm plays |
+| `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
 
@@ -142,6 +144,7 @@ docker compose logs -f --tail=200 autosub    # follow
 curl -fsS http://127.0.0.1:7000/healthz      # providers, job counts, uptime
 docker compose build --pull && docker compose up -d   # update
 npm run smoke -- tt1234567                   # end-to-end check against a real title
+curl -fsS $PUBLIC_URL/$INSTALL_TOKEN/stats   # what recent runs cost, stage by stage
 ```
 
 Each finished subtitle carries `X-AutoSub-Confidence`, `X-AutoSub-Provider`, `X-AutoSub-Translated` and `X-AutoSub-Variant` headers, and the logs record the chosen provider, language, confidence, offset and rate for every run. [docs/operations.md](docs/operations.md) covers failure modes, status codes and troubleshooting.

@@ -78,7 +78,9 @@ The subtitle list is requested *before* or *around* the play redirect depending 
 
 Each result carries a variant id — `provider:providerId`, or that id prefixed with `gemini:` for a translation — which is what a rejection records. Rejecting a translation bars its source track, because reusing that track would produce the same translation again. Audio probes are kept in memory per release, so a rejection-driven re-run skips ffmpeg entirely and finishes in seconds.
 
-Candidates are downloaded in waves of up to three, taking the best remaining entry from distinct providers, so a single provider's near-duplicate files cannot consume the whole budget (and, for OpenSubtitles, the account's download quota).
+Candidates are downloaded in waves of up to three, taking the best remaining entry from distinct providers, so a single provider's near-duplicate files cannot consume the whole budget (and, for OpenSubtitles, the account's download quota). The first wave of target-language files starts downloading while the source track is still being validated — the same files that wave would have fetched anyway, so it costs no extra quota and takes the transfer off the critical path.
+
+Every run records the wall-clock cost of each stage; `/stats` reports the last 25. Audio analysis dominates a cold run, so its length adapts to the release: sampling reads the interleaved container, and `AUDIO_BUDGET_MB` caps how much of it one analysis may pull.
 
 ## Alignment
 

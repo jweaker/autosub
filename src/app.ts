@@ -13,12 +13,12 @@ import {
   failedLabel,
   failureTrack,
   noticeTrack,
-  preparingLabel,
   preparingTrack,
   resultLabel,
   retryLabel,
   withBanner,
 } from "./status.js";
+import type { AutoSubPipeline } from "./pipeline.js";
 import type { StreamRegistry, UpstreamStreamAddon } from "./streams.js";
 
 export interface AppDependencies {
@@ -27,15 +27,10 @@ export interface AppDependencies {
   upstream: UpstreamStreamAddon;
   jobs: JobManager;
   providers: SubtitleProvider[];
+  /** Source of the recent-run summaries served by /stats. */
+  pipeline: Pick<AutoSubPipeline, "recentRuns">;
 }
 
-/**
- * Builds the Stremio addon HTTP surface.
- *
- * Kept separate from process bootstrap so the routes can be exercised against
- * stub dependencies in tests, which is the only way to check what a player
- * actually receives without a TV in the loop.
- */
 interface Bucket {
   count: number;
   reset: number;
@@ -69,7 +64,14 @@ function statusFor(error: unknown): number {
   return 502;
 }
 
-export function createApp({ config, registry, upstream, jobs, providers }: AppDependencies): Express {
+/**
+ * Builds the Stremio addon HTTP surface.
+ *
+ * Kept separate from process bootstrap so the routes can be exercised against
+ * stub dependencies in tests, which is the only way to check what a player
+ * actually receives without a TV in the loop.
+ */
+export function createApp({ config, registry, upstream, jobs, providers, pipeline }: AppDependencies): Express {
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
@@ -144,6 +146,12 @@ export function createApp({ config, registry, upstream, jobs, providers }: AppDe
     response.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width"><title>Install AutoSub</title><style>body{font:18px system-ui;max-width:46rem;margin:8vh auto;padding:1rem;background:#101216;color:#eee}a{display:inline-block;padding:.8rem 1rem;background:#7657ff;color:white;border-radius:.5rem;text-decoration:none}code{overflow-wrap:anywhere;color:#9ee}</style><h1>AutoSub</h1><p>Arabic is configured as the default. Keep this URL private because it grants access to your addon.</p><p><a href="${installUrl}">Install in Stremio</a></p><p><code>${manifestUrl}</code></p>`);
   });
 
+  // Behind the token because it names the titles that were played.
+  app.get("/:token/stats", authorized, (_request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.json({ runs: pipeline.recentRuns() });
+  });
+
   app.get("/:token/manifest.json", authorized, (_request, response) => {
     response.setHeader("Cache-Control", "public, max-age=300");
     response.json(manifest);
@@ -194,9 +202,13 @@ export function createApp({ config, registry, upstream, jobs, providers }: AppDe
    * Builds the menu for one language.
    *
    * The first entry keeps the plain ISO code so Stremio's "preferred subtitle
-   * language" still auto-selects it. The extra entries exist only to tell the
-   * viewer what they got and to offer a way out, so they carry descriptive
-   * labels that no language preference will ever match.
+   * language" still auto-selects it. The protocol offers no field other than
+   * `lang` for a row label, so anything else has to look like a language —
+   * which is why there is at most one extra entry, and why it never describes
+   * work in progress: the player fetches this list once, when playback starts,
+   * and never again. A "preparing" label written then would still say
+   * "preparing" an hour later. Progress is reported by the subtitle file
+   * itself, which is generated at the moment it is requested.
    */
   async function entriesFor(request: SubtitleRequest, stream: StreamRecord, language: string): Promise<SubtitleEntry[]> {
     const jobId = await jobs.startTracked(request, stream, language);
@@ -207,11 +219,14 @@ export function createApp({ config, registry, upstream, jobs, providers }: AppDe
     }];
     if (!config.menuEntries) return entries;
 
+    // Only state that cannot go stale earns a row: a finished result (a warm
+    // or cached play) and the always-valid "try another" action.
     const snapshot = await jobs.snapshot(jobId, config.statusProbeMs);
-    const label = snapshot?.state === "ready"
-      ? resultLabel(snapshot.result)
-      : snapshot?.state === "failed" ? failedLabel() : preparingLabel(language);
-    entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: label });
+    if (snapshot?.state === "ready") {
+      entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: resultLabel(snapshot.result) });
+    } else if (snapshot?.state === "failed") {
+      entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: failedLabel() });
+    }
     entries.push({ id: `autosub-next-${jobId}`, url: fileUrl(`next/${jobId}.srt`), lang: retryLabel(language) });
     return entries;
   }

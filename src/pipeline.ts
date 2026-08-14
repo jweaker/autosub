@@ -16,6 +16,20 @@ const PROBE_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_CACHED_PROBES = 12;
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 const CANDIDATES_PER_WAVE = 3;
+const DOWNLOAD_REUSE_MS = 60_000;
+const MAX_TRACKED_RUNS = 25;
+
+export interface RunSummary {
+  at: string;
+  contentId: string;
+  language: string;
+  outcome: "cached" | "direct" | "translated" | "failed";
+  provider?: string;
+  confidence?: number;
+  release?: string;
+  totalMs: number;
+  stages: Record<string, number>;
+}
 
 interface Evaluated {
   ranked: RankedCandidate;
@@ -42,7 +56,9 @@ export class AutoSubPipeline {
   private readonly translator: GeminiTranslator;
   private readonly cache: SubtitleCache;
   private readonly byName: Map<string, SubtitleProvider>;
-  private readonly probes = new Map<string, { probe: AudioProbeResult; at: number }>();
+  private readonly downloads = new Map<string, Promise<Uint8Array>>();
+  private readonly probes = new Map<string, { probe: Promise<AudioProbeResult>; at: number }>();
+  private readonly runs: RunSummary[] = [];
 
   constructor(
     private readonly config: AppConfig,
@@ -108,13 +124,41 @@ export class AutoSubPipeline {
     return wave;
   }
 
-  private async evaluateCandidate(item: RankedCandidate, align: Aligner): Promise<Evaluated | undefined> {
-    const provider = this.byName.get(item.candidate.provider);
-    if (!provider) return undefined;
+  /**
+   * Starts downloading the candidates that are about to be evaluated anyway.
+   *
+   * These are the same files the first wave would fetch, so this costs no extra
+   * provider quota; it just moves the transfer off the critical path while the
+   * source track is still being validated.
+   */
+  private prefetch(request: SubtitleRequest, candidates: SubtitleCandidate[], excluded: Set<string>): void {
+    const usable = candidates.filter((candidate) => !excluded.has(variantId(candidate)));
+    for (const ranked of rankCandidates(request, usable).slice(0, CANDIDATES_PER_WAVE)) {
+      void this.download(ranked.candidate).catch(() => undefined);
+    }
+  }
+
+  private download(candidate: SubtitleCandidate): Promise<Uint8Array> {
+    const id = variantId(candidate);
+    const pending = this.downloads.get(id);
+    if (pending) return pending;
+    const provider = this.byName.get(candidate.provider);
+    if (!provider) return Promise.reject(new Error(`Unknown provider ${candidate.provider}`));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+    const attempt = provider.download(candidate, controller.signal).finally(() => {
+      clearTimeout(timer);
+      // Only the in-flight transfer is shared; the bytes are not kept around.
+      setTimeout(() => this.downloads.delete(id), DOWNLOAD_REUSE_MS).unref?.();
+    });
+    this.downloads.set(id, attempt);
+    return attempt;
+  }
+
+  private async evaluateCandidate(item: RankedCandidate, align: Aligner): Promise<Evaluated | undefined> {
+    if (!this.byName.has(item.candidate.provider)) return undefined;
     try {
-      const raw = await provider.download(item.candidate, controller.signal);
+      const raw = await this.download(item.candidate);
       const aligned = align(parseSrt(prepareSubtitle(raw, item.candidate)));
       return {
         ranked: item,
@@ -126,8 +170,6 @@ export class AutoSubPipeline {
     } catch (error) {
       console.warn(`${item.candidate.provider} candidate ${item.candidate.providerId} failed:`, describe(error));
       return undefined;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -213,21 +255,43 @@ export class AutoSubPipeline {
     };
     const excluded = new Set(excludeIds.map((id) => (id.startsWith(TRANSLATED_PREFIX) ? id.slice(TRANSLATED_PREFIX.length) : id)));
     const key = this.cacheKey(request, stream, target, excludeIds);
+    const stages: Record<string, number> = {};
+    const mark = <T>(stage: string, work: Promise<T>): Promise<T> => {
+      const from = Date.now();
+      return work.finally(() => {
+        stages[stage] = Date.now() - from;
+      });
+    };
+    const summary = (outcome: RunSummary["outcome"], result?: CompletedSubtitle): void => this.record({
+      at: new Date().toISOString(),
+      contentId: request.contentId,
+      language: target,
+      outcome,
+      provider: result?.provider,
+      confidence: result?.confidence,
+      release: request.filename,
+      totalMs: Date.now() - started,
+      stages,
+    });
+
     const cached = await this.cache.get(key);
-    if (cached) return cached;
+    if (cached) {
+      summary("cached", cached);
+      return cached;
+    }
     if (!this.config.audioAnalysisEnabled) throw new Error("Audio analysis is disabled; refusing to guess a subtitle");
     if (excludeIds.length) console.log(`Preparing ${target} for ${request.contentId} while skipping ${excludeIds.length} rejected subtitle(s)`);
 
-    const metadataLanguage = await this.metadata.originalLanguage(request.imdbId, request.type);
+    const metadataLanguage = await mark("metadata", this.metadata.originalLanguage(request.imdbId, request.type));
     const initialSourceLanguages = normalizedSet([metadataLanguage, ...this.config.referenceLanguages]);
 
     // Audio analysis and the provider searches are independent; overlapping
     // them removes several seconds from every cold start.
-    const analysisPromise = this.analyze(stream, metadataLanguage);
-    const initialSourcePromise = this.search(request, initialSourceLanguages);
+    const analysisPromise = mark("audio", this.analyze(stream, metadataLanguage));
+    const initialSourcePromise = mark("search", this.search(request, initialSourceLanguages));
     const targetPromise = initialSourceLanguages.includes(target)
       ? initialSourcePromise
-      : this.search(request, [target]);
+      : mark("searchTarget", this.search(request, [target]));
 
     const probe = await analysisPromise;
     const sourceLanguages = normalizedSet([...initialSourceLanguages, probe.audioLanguage]);
@@ -240,17 +304,24 @@ export class AutoSubPipeline {
       targetPromise,
     ]);
 
-    const source = await this.evaluate(
+    // The target files are needed next in almost every run; fetching them now
+    // overlaps their transfer with validating the source track.
+    if (!sourceLanguages.includes(target)) this.prefetch(request, targetCandidates, excluded);
+
+    const source = await mark("validateSource", this.evaluate(
       request,
       [...initialSource, ...additionalSource],
       (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
       excluded,
-    );
-    if (!source) throw new Error(`No subtitle in ${sourceLanguages.join(", ")} matched the transcribed audio`);
-    log("Trusted timing", source, probe, started);
+    ));
+    if (!source) {
+      summary("failed");
+      throw new Error(`No subtitle in ${sourceLanguages.join(", ")} matched the transcribed audio`);
+    }
+    log("Trusted timing", source, probe, started, stages);
 
     if (sourceLanguages.includes(target)) {
-      return this.store({
+      const result = await this.store({
         key,
         id: variantId(source.ranked.candidate),
         language: target,
@@ -259,18 +330,20 @@ export class AutoSubPipeline {
         provider: source.ranked.candidate.provider,
         translated: false,
       });
+      summary("direct", result);
+      return result;
     }
 
     const referenceCues = parseSrt(source.content);
-    const direct = await this.evaluate(
+    const direct = await mark("validateTarget", this.evaluate(
       request,
       targetCandidates,
       (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
       excluded,
-    );
+    ));
     if (direct) {
-      log(`Direct ${target} subtitle`, direct, probe, started);
-      return this.store({
+      log(`Direct ${target} subtitle`, direct, probe, started, stages);
+      const result = await this.store({
         key,
         id: variantId(direct.ranked.candidate),
         language: target,
@@ -279,12 +352,14 @@ export class AutoSubPipeline {
         provider: direct.ranked.candidate.provider,
         translated: false,
       });
+      summary("direct", result);
+      return result;
     }
 
     const sourceLanguage = normalizeLanguage(source.ranked.candidate.language) || sourceLanguages[0];
     console.log(`No direct ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.config.gemini.model}`);
-    const translated = await this.translator.translate(referenceCues, sourceLanguage, target);
-    return this.store({
+    const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
+    const result = await this.store({
       key,
       id: `${TRANSLATED_PREFIX}${variantId(source.ranked.candidate)}`,
       language: target,
@@ -294,6 +369,8 @@ export class AutoSubPipeline {
       translated: true,
       sourceLanguage,
     });
+    summary("translated", result);
+    return result;
   }
 
   /**
@@ -301,18 +378,31 @@ export class AutoSubPipeline {
    * questions of the same audio, so a probe is kept in memory for the release.
    * Reusing the object also reuses the aligner's per-window precomputation.
    */
-  private async analyze(stream: StreamRecord, metadataLanguage: string | undefined): Promise<AudioProbeResult> {
+  private analyze(stream: StreamRecord, metadataLanguage: string | undefined): Promise<AudioProbeResult> {
     const key = stream.videoHash || stream.url;
     const cached = this.probes.get(key);
     if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.probe;
-    const probe = await this.audio.analyze(stream, metadataLanguage);
+    // The promise is cached, not the result, so two languages starting together
+    // share one ffmpeg pass instead of racing to make the same one.
+    const probe = this.audio.analyze(stream, metadataLanguage);
     this.probes.set(key, { probe, at: Date.now() });
+    void probe.catch(() => this.probes.delete(key));
     while (this.probes.size > MAX_CACHED_PROBES) {
       const oldest = this.probes.keys().next();
       if (oldest.done) break;
       this.probes.delete(oldest.value);
     }
     return probe;
+  }
+
+  /** Most recent preparations, newest first, for the /stats endpoint. */
+  recentRuns(): RunSummary[] {
+    return [...this.runs].reverse();
+  }
+
+  private record(summary: RunSummary): void {
+    this.runs.push(summary);
+    if (this.runs.length > MAX_TRACKED_RUNS) this.runs.shift();
   }
 }
 
@@ -330,7 +420,8 @@ function normalizedSet(values: Array<string | undefined>): string[] {
   return [...new Set(values.map(normalizeLanguage).filter((value): value is string => Boolean(value)))];
 }
 
-function log(label: string, choice: Evaluated, probe: AudioProbeResult, startedAt: number): void {
+function log(label: string, choice: Evaluated, probe: AudioProbeResult, startedAt: number, stages: Record<string, number>): void {
+  const breakdown = Object.entries(stages).map(([stage, ms]) => `${stage}=${ms}ms`).join(" ");
   console.log([
     `${label} selected from ${choice.ranked.candidate.provider}`,
     `language=${normalizeLanguage(choice.ranked.candidate.language) || "unknown"}`,
@@ -339,5 +430,6 @@ function log(label: string, choice: Evaluated, probe: AudioProbeResult, startedA
     `rate=${choice.rate?.toFixed(6) || "unknown"}`,
     `audioWindows=${probe.windows.length}`,
     `elapsed=${Date.now() - startedAt}ms`,
+    breakdown,
   ].join("; "));
 }

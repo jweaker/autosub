@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CompletedSubtitle, SubtitleCue } from "../src/domain.js";
 import { parseSrt } from "../src/srt.js";
-import { bannerText, exhaustedTrack, noticeTrack, preparingLabel, resultLabel, retryLabel, withBanner } from "../src/status.js";
+import { bannerText, exhaustedTrack, failedLabel, noticeTrack, resultLabel, retryLabel, withBanner } from "../src/status.js";
 
 const result = (overrides: Partial<CompletedSubtitle> = {}): CompletedSubtitle => ({
   key: "k",
@@ -26,13 +26,13 @@ describe("status labels", () => {
       .toBe("AutoSub: AI translated from English (74%)");
   });
 
-  it("uses readable language names while work is pending", () => {
-    expect(preparingLabel("ar")).toBe("AutoSub: preparing Arabic...");
-    expect(retryLabel("ar")).toBe("AutoSub: try another Arabic subtitle");
+  it("names the language first so the row reads like the list it sits in", () => {
+    expect(retryLabel("ar")).toBe("Arabic - try another (AutoSub)");
+    expect(failedLabel()).toBe("AutoSub: nothing matched this release");
   });
 
   it("keeps labels free of symbols that TV fonts may not have", () => {
-    const labels = [resultLabel(result()), preparingLabel("ar"), retryLabel("ar"), bannerText(result())];
+    const labels = [resultLabel(result()), failedLabel(), retryLabel("ar"), bannerText(result())];
     for (const label of labels) expect(label).toMatch(/^[\x20-\x7E]+$/);
   });
 });

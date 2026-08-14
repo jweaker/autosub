@@ -8,6 +8,7 @@
 | `GET /` | Static page that deliberately reveals nothing |
 | `GET /:token/configure` | Install page with the deep link and manifest URL |
 | `GET /:token/manifest.json` | Stremio addon manifest |
+| `GET /:token/stats` | What recent preparations cost, stage by stage |
 | `GET /:token/stream/:type/:id.json` | Upstream streams, rewritten as play links |
 | `GET /:token/play/:playId` | Records the release, starts preparation, 302s to the debrid URL |
 | `GET /:token/subtitles/:type/:id[/:extra].json` | Subtitle list for the release being played |
@@ -36,6 +37,27 @@ curl -fsS http://127.0.0.1:7000/healthz | jq
 ```
 
 A provider missing from `providers` has no API key configured. `translation: "disabled"` means no Gemini key, so a title with no direct target-language match will simply fail.
+
+## Where the time goes
+
+```bash
+curl -fsS "$PUBLIC_URL/$INSTALL_TOKEN/stats" | jq '.runs[0]'
+```
+
+```json
+{
+  "at": "2026-08-14T16:02:11.418Z",
+  "contentId": "tt0111161",
+  "language": "ar",
+  "outcome": "direct",
+  "provider": "opensubtitles",
+  "confidence": 76,
+  "totalMs": 41210,
+  "stages": { "metadata": 210, "audio": 33120, "search": 1980, "validateSource": 4100, "validateTarget": 3800 }
+}
+```
+
+`audio` almost always dominates a cold run, and it is bandwidth, not CPU: sampling reads the interleaved container, so the cost scales with the release's bitrate. `AUDIO_BUDGET_MB` caps it. `outcome` is `cached`, `direct`, `translated` or `failed`.
 
 ## Status codes
 

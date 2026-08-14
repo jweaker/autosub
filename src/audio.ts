@@ -20,6 +20,7 @@ interface Transcription {
 interface Sample {
   window: VadWindow;
   pcm: Buffer;
+  language?: string;
 }
 
 const SAMPLE_RATE = 16_000;
@@ -30,6 +31,17 @@ const VAD_TIMEOUT_MS = 20_000;
 const TRANSCRIBE_TIMEOUT_MS = 20_000;
 const MINIMUM_WINDOWS = 3;
 const MINIMUM_TRANSCRIPTS = 3;
+const MINIMUM_SAMPLE_SECONDS = 8;
+const PROBE_SIZE_BYTES = 8 * 1024 * 1024;
+const PROBE_ANALYZE_US = 4_000_000;
+// Persistent connections and reconnects: every window is a fresh range request
+// into a remote file, and a dropped one used to cost the whole sample.
+const HTTP_INPUT_ARGS = [
+  "-multiple_requests", "1",
+  "-reconnect", "1",
+  "-reconnect_streamed", "1",
+  "-reconnect_delay_max", "5",
+];
 
 function safeHeaders(headers?: Record<string, string>): string | undefined {
   if (!headers) return undefined;
@@ -39,6 +51,20 @@ function safeHeaders(headers?: Record<string, string>): string | undefined {
     .filter(([key, value]) => !/[\r\n]/.test(key) && !/[\r\n]/.test(value))
     .map(([key, value]) => `${key}: ${value}`);
   return lines.length ? `${lines.join("\r\n")}\r\n` : undefined;
+}
+
+/**
+ * Sample length capped by a byte budget rather than a fixed number of seconds.
+ *
+ * Sampling reads the interleaved container, so fifteen seconds of a 100 Mbit
+ * remux is a hundred megabytes per window while the same fifteen seconds of a
+ * web release is twenty. Trading length for bytes on the heavy releases keeps a
+ * cold run bounded by bandwidth rather than by whichever file was picked.
+ */
+export function sampleSecondsFor(requested: number, count: number, budgetBytes: number, bytesPerSecond?: number): number {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return requested;
+  const perWindow = budgetBytes / Math.max(1, count);
+  return Math.max(MINIMUM_SAMPLE_SECONDS, Math.min(requested, Math.floor(perWindow / bytesPerSecond)));
 }
 
 /**
@@ -211,25 +237,41 @@ export class AudioAnalyzer {
       || streams[0];
   }
 
-  private async probe(mediaUrl: string, headers?: string): Promise<{ durationMs: number; streams: ProbeStream[] }> {
-    const args = ["-v", "error"];
+  private async probe(mediaUrl: string, headers?: string): Promise<{ durationMs: number; streams: ProbeStream[]; bytesPerSecond?: number }> {
+    const args = ["-v", "error", ...HTTP_INPUT_ARGS, "-probesize", String(PROBE_SIZE_BYTES), "-analyzeduration", String(PROBE_ANALYZE_US)];
     if (headers) args.push("-headers", headers);
     args.push(
-      "-show_entries", "format=duration:stream=index,codec_type:stream_tags=language,title:stream_disposition=default",
+      "-show_entries", "format=duration,size,bit_rate:stream=index,codec_type:stream_tags=language,title:stream_disposition=default",
       "-of", "json", mediaUrl,
     );
     const result = await runProcess(this.config.ffprobePath, args, { timeoutMs: PROBE_TIMEOUT_MS, maxOutputBytes: 2 * 1024 * 1024 });
-    const data = JSON.parse(result.stdout.toString("utf8")) as { format?: { duration?: string }; streams?: ProbeStream[] };
+    const data = JSON.parse(result.stdout.toString("utf8")) as {
+      format?: { duration?: string; size?: string; bit_rate?: string };
+      streams?: ProbeStream[];
+    };
     const durationMs = Math.round(Number(data.format?.duration) * 1000);
     if (!Number.isFinite(durationMs) || durationMs < 60_000) throw new Error("Could not determine media duration");
-    return { durationMs, streams: data.streams || [] };
+
+    // Sampling reads the interleaved container, not just the audio track, so
+    // the release's overall bitrate is what a sample actually costs.
+    const bitrate = Number(data.format?.bit_rate);
+    const size = Number(data.format?.size);
+    const bytesPerSecond = Number.isFinite(bitrate) && bitrate > 0
+      ? bitrate / 8
+      : (Number.isFinite(size) && size > 0 ? size / (durationMs / 1000) : undefined);
+    return { durationMs, streams: data.streams || [], bytesPerSecond };
   }
+
+
 
   private sampler(mediaUrl: string, headers: string | undefined, streamIndex: number, seconds: number) {
     return async (startMs: number): Promise<Sample | undefined> => {
-      const args = ["-v", "error", "-ss", (startMs / 1000).toFixed(3)];
+      const args = ["-v", "error", ...HTTP_INPUT_ARGS, "-ss", (startMs / 1000).toFixed(3)];
       if (headers) args.push("-headers", headers);
-      args.push("-i", mediaUrl, "-t", String(seconds), "-map", `0:${streamIndex}`, "-vn", "-ac", "1", "-ar", String(SAMPLE_RATE), "-f", "s16le", "pipe:1");
+      args.push(
+        "-i", mediaUrl, "-t", String(seconds), "-map", `0:${streamIndex}`,
+        "-vn", "-sn", "-dn", "-ac", "1", "-ar", String(SAMPLE_RATE), "-f", "s16le", "pipe:1",
+      );
       try {
         const extraction = await runProcess(this.config.ffmpegPath, args, {
           timeoutMs: Math.max(45_000, seconds * 2_000),
@@ -251,33 +293,50 @@ export class AudioAnalyzer {
     };
   }
 
-  /** Runs samples in bounded waves; remote range seeks dominate cold-start latency. */
-  private async collect(starts: number[], sample: (startMs: number) => Promise<Sample | undefined>): Promise<Sample[]> {
+  /**
+   * One window, end to end: extract, detect speech, transcribe.
+   *
+   * Transcribing here rather than after every sample has landed means the
+   * Deepgram round trip for one window overlaps the download of the next,
+   * which takes it off the critical path entirely.
+   */
+  private analyser(
+    mediaUrl: string,
+    headers: string | undefined,
+    streamIndex: number,
+    seconds: number,
+    languageHint?: string,
+  ): (startMs: number) => Promise<Sample | undefined> {
+    const sample = this.sampler(mediaUrl, headers, streamIndex, seconds);
+    return async (startMs: number): Promise<Sample | undefined> => {
+      const item = await sample(startMs);
+      if (!item) return undefined;
+      const transcription = await this.transcribe(item.pcm, languageHint);
+      item.window.transcript = transcription.transcript;
+      item.window.words = transcription.words;
+      item.language = transcription.language;
+      return item;
+    };
+  }
+
+  /** Runs windows in bounded waves; remote range seeks dominate cold-start latency. */
+  private async collect(starts: number[], analyse: (startMs: number) => Promise<Sample | undefined>): Promise<Sample[]> {
     const collected: Sample[] = [];
     const size = this.config.audioConcurrency;
     for (let index = 0; index < starts.length; index += size) {
-      const wave = await Promise.all(starts.slice(index, index + size).map(sample));
+      const wave = await Promise.all(starts.slice(index, index + size).map(analyse));
       for (const item of wave) if (item) collected.push(item);
     }
     return collected;
   }
 
-  private async attachTranscripts(samples: Sample[], languageHint: string | undefined): Promise<string | undefined> {
-    const transcriptions = await Promise.all(samples.map((item) => this.transcribe(item.pcm, languageHint)));
-    let detected: string | undefined;
-    for (let index = 0; index < samples.length; index += 1) {
-      samples[index].window.transcript = transcriptions[index].transcript;
-      samples[index].window.words = transcriptions[index].words;
-      detected ||= transcriptions[index].language;
-    }
-    return detected;
-  }
-
   async analyze(stream: StreamRecord, preferredLanguage?: string): Promise<AudioProbeResult> {
     const started = Date.now();
     const mediaUrl = await this.resolveMediaUrl(stream);
+    const resolvedAt = Date.now();
     const headers = safeHeaders(stream.requestHeaders);
-    const { durationMs, streams } = await this.probe(mediaUrl, headers);
+    const { durationMs, streams, bytesPerSecond } = await this.probe(mediaUrl, headers);
+    const probedAt = Date.now();
 
     const audioStreams = streams.filter((item) => item.codec_type === "audio");
     if (!audioStreams.length) throw new Error("Media contains no audio stream");
@@ -286,18 +345,15 @@ export class AudioAnalyzer {
     let audioLanguage = normalizeLanguage(selected.tags?.language);
 
     const count = Math.max(MINIMUM_WINDOWS + 1, this.config.audioSampleCount);
-    const seconds = Math.min(this.config.audioSampleSeconds, Math.max(20, durationMs / 1000 / (count + 2)));
+    const seconds = sampleSecondsFor(this.config.audioSampleSeconds, count, this.config.audioBudgetBytes, bytesPerSecond);
     // Skip credits at both ends: the opening logos and the closing crawl carry
     // little dialogue and often differ between releases.
     const usableStart = Math.min(120_000, durationMs * 0.04);
     const usableEnd = Math.max(usableStart, (durationMs * 0.92) - (seconds * 1000));
     const starts = Array.from({ length: count }, (_, index) => usableStart + ((usableEnd - usableStart) * index / Math.max(1, count - 1)));
 
-    const sample = this.sampler(mediaUrl, headers, selected.index, seconds);
-    const samples = await this.collect(starts, sample);
-    // A container language tag stays authoritative; detection only fills a gap.
-    const detected = await this.attachTranscripts(samples, preferred || audioLanguage);
-    audioLanguage ||= detected;
+    const analyse = this.analyser(mediaUrl, headers, selected.index, seconds, preferred || audioLanguage);
+    const samples = await this.collect(starts, analyse);
 
     // Quiet windows are common (action scenes, music). Replace a few rather
     // than failing the whole title.
@@ -306,16 +362,38 @@ export class AudioAnalyzer {
         .map((fraction) => usableStart + ((usableEnd - usableStart) * fraction))
         .filter((startMs) => starts.every((existing) => Math.abs(existing - startMs) > seconds * 2_000))
         .slice(0, 2);
-      const retries = await this.collect(alternatives, sample);
-      const retryLanguage = await this.attachTranscripts(retries, preferred || audioLanguage);
-      audioLanguage ||= retryLanguage;
-      samples.push(...retries);
+      samples.push(...await this.collect(alternatives, analyse));
     }
+
+    // A container language tag stays authoritative; detection only fills a gap.
+    audioLanguage ||= samples.find((item) => item.language)?.language;
 
     const windows = samples.map((item) => item.window).sort((left, right) => left.startMs - right.startMs);
     if (windows.length < MINIMUM_WINDOWS) throw new Error("Not enough audio samples could be read from the selected stream");
     const transcripts = windows.filter((window) => window.transcript).length;
-    console.log(`Audio analysis completed with ${windows.length} windows (${starts.length} primary) and ${transcripts} transcripts; language=${audioLanguage || "unknown"}; elapsed=${Date.now() - started}ms`);
-    return { durationMs, audioLanguage, audioStreamIndex: selected.index, windows };
+    const megabitsPerSecond = bytesPerSecond ? Number(((bytesPerSecond * 8) / 1e6).toFixed(1)) : undefined;
+    console.log([
+      `Audio analysis: ${windows.length} windows (${starts.length} primary) of ${seconds}s`,
+      `${transcripts} transcripts`,
+      `language=${audioLanguage || "unknown"}`,
+      `release=${megabitsPerSecond ? `${megabitsPerSecond}Mbps` : "unknown bitrate"}`,
+      `resolve=${resolvedAt - started}ms probe=${probedAt - resolvedAt}ms sample=${Date.now() - probedAt}ms`,
+      `elapsed=${Date.now() - started}ms`,
+    ].join("; "));
+
+    return {
+      durationMs,
+      audioLanguage,
+      audioStreamIndex: selected.index,
+      windows,
+      sampleSeconds: seconds,
+      megabitsPerSecond,
+      timings: {
+        resolveMs: resolvedAt - started,
+        probeMs: probedAt - resolvedAt,
+        sampleMs: Date.now() - probedAt,
+        totalMs: Date.now() - started,
+      },
+    };
   }
 }

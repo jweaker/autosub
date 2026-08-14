@@ -57,6 +57,11 @@ export interface AudioProbeResult {
   audioLanguage?: string;
   audioStreamIndex: number;
   windows: VadWindow[];
+  /** Wall-clock cost of each stage, reported by /stats. */
+  timings?: { resolveMs: number; probeMs: number; sampleMs: number; totalMs: number };
+  /** Sample length actually used, which adapts to the release's bitrate. */
+  sampleSeconds?: number;
+  megabitsPerSecond?: number;
 }
 
 export interface AlignmentResult {

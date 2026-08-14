@@ -18,6 +18,8 @@ export interface AppConfig {
   audioSampleCount: number;
   audioSampleSeconds: number;
   audioConcurrency: number;
+  /** Ceiling on how many bytes one audio analysis may pull from the release. */
+  audioBudgetBytes: number;
   maxSyncOffsetSeconds: number;
   streamTtlMs: number;
   cacheTtlMs: number;
@@ -84,6 +86,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     audioSampleCount: asInt(env.AUDIO_SAMPLE_COUNT, 4, 3, 12),
     audioSampleSeconds: asInt(env.AUDIO_SAMPLE_SECONDS, 15, 5, 60),
     audioConcurrency: asInt(env.AUDIO_CONCURRENCY, 4, 1, 8),
+    audioBudgetBytes: asNumber(env.AUDIO_BUDGET_MB, 240, 32, 4_096) * 1024 * 1024,
     maxSyncOffsetSeconds: asNumber(env.MAX_SYNC_OFFSET_SECONDS, 180, 5, 900),
     streamTtlMs: asNumber(env.STREAM_TTL_HOURS, 6, 0.25, 168) * 3_600_000,
     cacheTtlMs: asNumber(env.CACHE_TTL_DAYS, 30, 0, 3_650) * 86_400_000,

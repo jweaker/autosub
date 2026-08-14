@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { energyVad } from "../src/audio.js";
+import { energyVad, sampleSecondsFor } from "../src/audio.js";
 
 const SAMPLE_RATE = 16_000;
 
@@ -38,5 +38,35 @@ describe("energy VAD", () => {
 
   it("returns nothing for a buffer shorter than one frame", () => {
     expect(energyVad(Buffer.alloc(64))).toEqual([]);
+  });
+});
+
+describe("sample length", () => {
+  const budget = 240 * 1024 * 1024;
+  const mbps = (rate: number): number => (rate * 1e6) / 8;
+
+  it("keeps the configured length for an ordinary release", () => {
+    // 8 Mbit 1080p: four 15s windows are only ~60 MB.
+    expect(sampleSecondsFor(15, 4, budget, mbps(8))).toBe(15);
+  });
+
+  it("shortens windows to stay inside the byte budget", () => {
+    // 40 Mbit: 15s windows would pull ~300 MB, so they are trimmed to fit.
+    const seconds = sampleSecondsFor(15, 4, budget, mbps(40));
+    expect(seconds).toBeLessThan(15);
+    expect(seconds * 4 * mbps(40)).toBeLessThanOrEqual(budget);
+  });
+
+  it("never goes below the length needed to hear dialogue", () => {
+    expect(sampleSecondsFor(15, 4, budget, mbps(400))).toBe(8);
+  });
+
+  it("falls back to the configured length when the bitrate is unknown", () => {
+    expect(sampleSecondsFor(12, 4, budget, undefined)).toBe(12);
+    expect(sampleSecondsFor(12, 4, budget, 0)).toBe(12);
+  });
+
+  it("never lengthens beyond what was asked for", () => {
+    expect(sampleSecondsFor(10, 4, budget, mbps(1))).toBe(10);
   });
 });

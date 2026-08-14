@@ -20,16 +20,16 @@ export function resultLabel(result: CompletedSubtitle): string {
     : `AutoSub: found on ${result.provider} (${result.confidence}%)`;
 }
 
-export function preparingLabel(language: string): string {
-  return `AutoSub: preparing ${languageName(language)}...`;
-}
-
 export function failedLabel(): string {
-  return "AutoSub: no subtitle passed validation";
+  return "AutoSub: nothing matched this release";
 }
 
+/**
+ * Reads as a language row because the protocol has no other place to put it,
+ * so it names the language first and the action second.
+ */
 export function retryLabel(language: string): string {
-  return `AutoSub: try another ${languageName(language)} subtitle`;
+  return `${languageName(language)} - try another (AutoSub)`;
 }
 
 /** One-line summary of what was delivered, shown briefly at the start of playback. */

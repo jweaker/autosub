@@ -224,6 +224,45 @@ describe("subtitle pipeline", () => {
       .rejects.toThrow(/matched the transcribed audio/);
   });
 
+  it("analyses the release once when two languages start together", async () => {
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `أ ${cue.id}` }))) }],
+    ]));
+    const pipeline = new AutoSubPipeline(await config(), [provider]);
+    await Promise.all([
+      pipeline.complete(request, stream, "ar"),
+      pipeline.complete({ ...request, languages: ["en"] }, stream, "en"),
+    ]);
+    expect(analyses.count).toBe(1);
+  });
+
+  it("downloads each candidate once despite prefetching", async () => {
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `أ ${cue.id}` }))) }],
+    ]));
+    await new AutoSubPipeline(await config(), [provider]).complete(request, stream, "ar");
+    expect(provider.downloads).toBe(2);
+  });
+
+  it("records what each run cost", async () => {
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `أ ${cue.id}` }))) }],
+    ]));
+    const pipeline = new AutoSubPipeline(await config(), [provider]);
+    await pipeline.complete(request, stream, "ar");
+    await pipeline.complete(request, stream, "ar");
+
+    const [latest, first] = pipeline.recentRuns();
+    expect(latest.outcome).toBe("cached");
+    expect(first.outcome).toBe("direct");
+    expect(first.contentId).toBe("tt1");
+    expect(Object.keys(first.stages)).toContain("audio");
+    expect(first.totalMs).toBeGreaterThanOrEqual(0);
+  });
+
   it("refuses to run at all when audio analysis is disabled", async () => {
     const provider = new FakeProvider("fake", new Map());
     await expect(new AutoSubPipeline(await config({ AUDIO_ANALYSIS_ENABLED: "false" }), [provider]).complete(request, stream, "ar"))
