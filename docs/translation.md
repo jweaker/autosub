@@ -30,6 +30,25 @@ TRANSLATION_API_KEY=sk-...
 TRANSLATION_MODEL=some-provider/some-model
 ```
 
+A private gateway that accepts only `model` and `messages` — some do — needs no
+special setting: the first rejected request teaches the client to send the bare
+form for the rest of its life.
+
+```dotenv
+TRANSLATION_PROVIDER=openai
+TRANSLATION_BASE_URL=https://your-gateway.example/v1
+TRANSLATION_API_KEY=...
+TRANSLATION_MODEL=your-model
+TRANSLATION_CONCURRENCY=2
+TRANSLATION_TIMEOUT_MS=180000
+```
+
+Reasoning models are slow enough to matter here: measured at roughly 27 seconds
+per 80-cue batch, a feature film takes about four minutes at a concurrency of
+two. That is longer than `JOB_WAIT_MS`, so the first request returns the
+"still preparing" notice and the subtitle appears when the row is selected
+again. Raise `TRANSLATION_CONCURRENCY` only as far as the endpoint allows.
+
 A model running on your own machine, where the only cost is electricity:
 
 ```dotenv

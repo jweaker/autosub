@@ -58,6 +58,8 @@ export interface AppConfig {
     baseUrl?: string;
     model: string;
     concurrency: number;
+    /** Per-request deadline; reasoning models need more than a chat model. */
+    timeoutMs: number;
   };
   gemini: { apiKey?: string; model: string; concurrency: number };
   deepgram: { apiKey?: string; model: string };
@@ -137,6 +139,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       baseUrl: env.TRANSLATION_BASE_URL,
       model: env.TRANSLATION_MODEL || env.GEMINI_MODEL || "gemini-3.5-flash",
       concurrency: asInt(env.TRANSLATION_CONCURRENCY, 2, 1, 8),
+      timeoutMs: asInt(env.TRANSLATION_TIMEOUT_MS, 120_000, 10_000, 600_000),
     },
     gemini: {
       apiKey: env.GEMINI_API_KEY,

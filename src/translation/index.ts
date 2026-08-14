@@ -21,7 +21,7 @@ export function createTranslator(config: AppConfig): Translator {
   const shared = { concurrency: translation.concurrency, apiKey: translation.apiKey, baseUrl: translation.baseUrl };
   switch (translation.provider) {
     case "openai":
-      return new OpenAiCompatibleTranslator({ ...shared, model: translation.model });
+      return new OpenAiCompatibleTranslator({ ...shared, model: translation.model, timeoutMs: translation.timeoutMs });
     case "deepl":
       return new DeepLTranslator(shared);
     case "libretranslate":

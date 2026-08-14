@@ -69,6 +69,32 @@ describe("OpenAI-compatible backend", () => {
     await expect(new OpenAiCompatibleTranslator(settings).translate(cues, "en", "ar")).rejects.toThrow(/1\/5/);
   });
 
+  it("drops optional fields for an endpoint that rejects them", async () => {
+    // Strict gateways allow only model and messages and refuse the rest, which
+    // should teach the client rather than fail the title.
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if ("temperature" in body || "response_format" in body) {
+        return new Response(JSON.stringify({ error: { message: "Invalid or unsupported chat completion request" } }), { status: 400 });
+      }
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify(cues.map((cue) => ({ id: cue.id, text: `ar${cue.id}` }))) } }] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const translator = new OpenAiCompatibleTranslator(settings);
+    const first = await translator.translate(cues, "en", "ar");
+    expect(first[0].text).toBe("ar1");
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual({ model: "test-model", messages: expect.any(Array) });
+
+    // And it stays learned, so later batches cost no extra round trip.
+    bodies.length = 0;
+    await translator.translate(cues, "en", "ar");
+    expect(bodies).toHaveLength(1);
+  });
+
   it("accepts a base URL that already names the endpoint", async () => {
     const fetchMock = vi.fn(async (url: string) => {
       expect(String(url)).toBe("https://gateway.test/v1/chat/completions");
