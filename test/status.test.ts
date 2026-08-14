@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CompletedSubtitle, SubtitleCue } from "../src/domain.js";
 import { parseSrt } from "../src/srt.js";
-import { bannerText, exhaustedTrack, failedLabel, noticeTrack, resultLabel, retryLabel, withBanner } from "../src/status.js";
+import { exhaustedTrack, failedLabel, noticeTrack, resultLabel, retryLabel, translateLabel, withBanner } from "../src/status.js";
 
 const result = (overrides: Partial<CompletedSubtitle> = {}): CompletedSubtitle => ({
   key: "k",
@@ -18,28 +18,39 @@ const cue = (startMs: number): SubtitleCue => ({ id: 1, startMs, endMs: startMs 
 
 describe("status labels", () => {
   it("names the provider for a found subtitle", () => {
-    expect(resultLabel(result())).toBe("AutoSub: found on subdl (74%)");
+    expect(resultLabel(result())).toBe("SubDL 74%");
   });
 
   it("says where a translation came from", () => {
     expect(resultLabel(result({ translated: true, sourceLanguage: "en" })))
-      .toBe("AutoSub: AI translated from English (74%)");
+      .toBe("AI English 74%");
   });
 
   it("names the language first so the row reads like the list it sits in", () => {
-    expect(retryLabel("ar")).toBe("Arabic - try another (AutoSub)");
-    expect(failedLabel()).toBe("AutoSub: nothing matched this release");
-    expect(failedLabel(true)).toBe("AutoSub: no direct match - AI translation available");
+    expect(retryLabel("ar")).toBe("Arabic - Next");
+    expect(failedLabel()).toBe("No subtitle match");
+    expect(failedLabel(true)).toBe("No match - AI");
   });
 
   it("numbers further attempts so they read as successive tries", () => {
-    expect(retryLabel("ar", 2)).toBe("Arabic - try another #2 (AutoSub)");
-    expect(retryLabel("ar", 3)).toBe("Arabic - try another #3 (AutoSub)");
+    expect(retryLabel("ar", 2)).toBe("Arabic - Next 2");
+    expect(retryLabel("ar", 3)).toBe("Arabic - Next 3");
   });
 
-  it("keeps labels free of symbols that TV fonts may not have", () => {
-    const labels = [resultLabel(result()), failedLabel(), retryLabel("ar"), bannerText(result())];
-    for (const label of labels) expect(label).toMatch(/^[\x20-\x7E]+$/);
+  it("keeps menu labels short and free of symbols that TV fonts may not have", () => {
+    const labels = [
+      resultLabel(result()),
+      resultLabel(result({ provider: "an-unusually-long-provider-name" })),
+      resultLabel(result({ translated: true, sourceLanguage: "pt" })),
+      failedLabel(),
+      failedLabel(true),
+      retryLabel("pt", 3),
+      translateLabel("pt"),
+    ];
+    for (const label of labels) {
+      expect(label).toMatch(/^[\x20-\x7E]+$/);
+      expect(label.length).toBeLessThanOrEqual(18);
+    }
   });
 });
 

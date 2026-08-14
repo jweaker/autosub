@@ -110,12 +110,12 @@ describe("addon HTTP surface", () => {
     const subtitles = await listSubtitles();
 
     expect(subtitles[0].lang).toBe("ara");
-    expect(subtitles[1].lang).toContain("found on opensubtitles");
+    expect(subtitles[1].lang).toContain("OpenSubs");
     expect(subtitles[1].lang).toContain("81%");
     expect(subtitles.slice(2).map((entry) => entry.lang)).toEqual([
-      "Arabic - try another (AutoSub)",
-      "Arabic - try another #2 (AutoSub)",
-      "Arabic - try another #3 (AutoSub)",
+      "Arabic - Next",
+      "Arabic - Next 2",
+      "Arabic - Next 3",
     ]);
     // Distinct URLs, because a player will not re-request a track it already
     // loaded — one shared URL could only ever be used once per playback.
@@ -146,7 +146,7 @@ describe("addon HTTP surface", () => {
     await start(async () => subtitle({ translated: true, provider: "subdl+gemini", sourceLanguage: "en", id: "gemini:subdl:7" }));
     await playStream();
     const subtitles = await listSubtitles();
-    expect(subtitles[1].lang).toContain("AI translated from English");
+    expect(subtitles[1].lang).toContain("AI English");
   });
 
   it("shows no status row while work is still running", async () => {
@@ -157,7 +157,7 @@ describe("addon HTTP surface", () => {
     const subtitles = await listSubtitles();
     expect(subtitles).toHaveLength(2);
     expect(subtitles[0].lang).toBe("ara");
-    expect(subtitles[1].lang).toBe("Arabic - try another (AutoSub)");
+    expect(subtitles[1].lang).toBe("Arabic - Next");
   });
 
   it("can be trimmed to a single row", async () => {
@@ -173,7 +173,7 @@ describe("addon HTTP surface", () => {
     }, { STATUS_PROBE_MS: "500" });
     await playStream();
     const subtitles = await listSubtitles();
-    expect(subtitles[1].lang).toBe("AutoSub: nothing matched this release");
+    expect(subtitles[1].lang).toBe("No subtitle match");
   });
 
   it("delivers the subtitle with a banner describing its origin", async () => {
@@ -217,7 +217,7 @@ describe("addon HTTP surface", () => {
     // The main entry now follows the replacement, and the rejection sticks.
     expect((await fetch(local(entries[0].url))).headers.get("x-autosub-variant")).toBe("subdl:2");
     const relisted = await listSubtitles();
-    expect(relisted[1].lang).toContain("found on subdl");
+    expect(relisted[1].lang).toContain("SubDL");
   });
 
   it("offers an AI translation instead of buying one unasked", async () => {
@@ -230,13 +230,13 @@ describe("addon HTTP surface", () => {
     const entries = await listSubtitles();
 
     const offer = entries.find((entry) => entry.url.includes("/translate/"));
-    expect(offer?.lang).toBe("Arabic - force AI translation, uses credits (AutoSub)");
-    expect(entries[1].lang).toBe("AutoSub: no direct match - AI translation available");
+    expect(offer?.lang).toBe("Arabic - AI (paid)");
+    expect(entries[1].lang).toBe("No match - AI");
 
     // The plain row explains the situation rather than silently spending.
     const plain = await fetch(local(entries[0].url));
     expect(plain.headers.get("x-autosub-state")).toBe("translation-offered");
-    expect(await plain.text()).toContain("AI translation");
+    expect(await plain.text()).toContain("Arabic - AI (paid)");
     expect(complete).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), true);
 
     // Choosing it is what authorises the spend.
@@ -274,8 +274,8 @@ describe("addon HTTP surface", () => {
     // The failed job itself was replaced, so its live URLs must change even
     // though Stremio's selector identities do not.
     expect(second.map((entry) => entry.url)).not.toEqual(first.map((entry) => entry.url));
-    expect(first.filter((entry) => entry.lang.includes("force AI"))).toHaveLength(1);
-    expect(second.filter((entry) => entry.lang.includes("force AI"))).toHaveLength(1);
+    expect(first.filter((entry) => entry.lang.includes("AI (paid)"))).toHaveLength(1);
+    expect(second.filter((entry) => entry.lang.includes("AI (paid)"))).toHaveLength(1);
   });
 
   it("hides the translation row when no model is configured", async () => {

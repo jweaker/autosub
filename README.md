@@ -36,11 +36,11 @@ Stremio gives an addon no way to show a spinner, so AutoSub reports itself throu
 | In the subtitle menu | Meaning |
 |---|---|
 | `Arabic` | The normal entry. Your preferred-language setting still auto-selects it. |
-| `Arabic - try another (AutoSub)` | Select this if the subtitle is wrong. |
-| `Arabic - try another #2 / #3` | Same thing again, for a second and third rejection. |
-| `Arabic - AI translate, uses credits` | Only when nothing matched: pay for a translation, explicitly. |
-| `AutoSub: found on opensubtitles (81%)` | Shown on a warm play, when the answer is already known. |
-| `AutoSub: AI translated from English (74%)` | Same, for a translated result. |
+| `Arabic - Next` | Select this if the subtitle is wrong. |
+| `Arabic - Next 2 / 3` | Same thing again, for a second and third rejection. |
+| `Arabic - AI (paid)` | Force a separately cached AI translation. |
+| `OpenSubs 81%` | A warm direct result, with provider and confidence. |
+| `AI English 74%` | A warm AI result, with source language and confidence. |
 
 The protocol gives an addon three fields per row — `id`, `url`, `lang` — and the player renders `lang`. So anything extra has to look like a language, which is why there is only one always-present extra row, and why **progress is never shown there**: the list is fetched once, when playback starts, so a "preparing" label written then would still say "preparing" an hour later.
 

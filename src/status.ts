@@ -8,22 +8,32 @@ const BANNER_MINIMUM_MS = 1_500;
 const NOTICE_INTERVAL_MS = 30_000;
 const NOTICE_LENGTH_MS = 5_000;
 const NOTICE_DEFAULT_DURATION_MS = 3 * 60 * 60 * 1000;
+const MENU_LABEL_MAX_LENGTH = 18;
 
-/**
- * Labels are shown in Stremio's subtitle menu on TVs whose fonts are often
- * limited, so they stay plain ASCII rather than using symbols that may render
- * as empty boxes.
- */
+function menuLabel(head: string, suffix: string): string {
+  return `${head.slice(0, Math.max(0, MENU_LABEL_MAX_LENGTH - suffix.length)).trimEnd()}${suffix}`;
+}
+
+/** Labels stay short and ASCII because TV subtitle menus are narrow. */
+function providerName(provider: string): string {
+  const known: Record<string, string> = {
+    opensubtitles: "OpenSubs",
+    subdl: "SubDL",
+    subsource: "SubSource",
+  };
+  return known[provider.toLowerCase()] || provider;
+}
+
 export function resultLabel(result: CompletedSubtitle): string {
   return result.translated
-    ? `AutoSub: AI translated from ${languageName(result.sourceLanguage || "")} (${result.confidence}%)`
-    : `AutoSub: found on ${result.provider} (${result.confidence}%)`;
+    ? menuLabel(`AI ${languageName(result.sourceLanguage || "")}`, ` ${result.confidence}%`)
+    : menuLabel(providerName(result.provider), ` ${result.confidence}%`);
 }
 
 export function failedLabel(translationAvailable = false): string {
   return translationAvailable
-    ? "AutoSub: no direct match - AI translation available"
-    : "AutoSub: nothing matched this release";
+    ? "No match - AI"
+    : "No subtitle match";
 }
 
 /**
@@ -35,11 +45,11 @@ export function failedLabel(translationAvailable = false): string {
  * only ever be used once per playback.
  */
 export function retryLabel(language: string, attempt = 1): string {
-  return `${languageName(language)} - try another${attempt > 1 ? ` #${attempt}` : ""} (AutoSub)`;
+  return menuLabel(languageName(language), ` - Next${attempt > 1 ? ` ${attempt}` : ""}`);
 }
 
 export function translateLabel(language: string): string {
-  return `${languageName(language)} - force AI translation, uses credits (AutoSub)`;
+  return menuLabel(languageName(language), " - AI (paid)");
 }
 
 export function translationOfferTrack(language: string): string {
@@ -54,7 +64,7 @@ export function bannerText(result: CompletedSubtitle): string {
   const origin = result.translated
     ? `AI translation from ${languageName(result.sourceLanguage || "")}`
     : `${result.provider} subtitle`;
-  return `[AutoSub] ${origin} - ${result.confidence}% match. Wrong one? Pick "try another" in the subtitle menu.`;
+  return `[AutoSub] ${origin} - ${result.confidence}% match. Wrong one? Pick "Next" in the subtitle menu.`;
 }
 
 /**
