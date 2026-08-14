@@ -11,7 +11,7 @@ import { MetadataService } from "./metadata.js";
 import { rankCandidates } from "./ranking.js";
 import { parseSrt, serializeSrt } from "./srt.js";
 import { prepareSubtitle } from "./subtitle-content.js";
-import { GeminiTranslator } from "./translation.js";
+import { createTranslator, type Translator } from "./translation/index.js";
 
 /** Cache key version; bump when a change should invalidate stored subtitles. */
 const CACHE_VERSION = 8;
@@ -67,7 +67,7 @@ const describe = (error: unknown): string => (error instanceof Error ? error.mes
 export class AutoSubPipeline {
   private readonly audio: AudioAnalyzer;
   private readonly metadata: MetadataService;
-  private readonly translator: GeminiTranslator;
+  private readonly translator: Translator;
   private readonly cache: SubtitleCache;
   private readonly byName: Map<string, SubtitleProvider>;
   private readonly downloads = new Map<string, Promise<Uint8Array>>();
@@ -83,7 +83,7 @@ export class AutoSubPipeline {
   ) {
     this.audio = new AudioAnalyzer(config);
     this.metadata = new MetadataService(config.tmdbToken);
-    this.translator = new GeminiTranslator(config.gemini);
+    this.translator = createTranslator(config);
     this.cache = cache;
     this.byName = new Map(providers.map((provider) => [provider.name, provider]));
     this.runsPath = join(config.dataDir, "runs.json");
@@ -227,7 +227,9 @@ export class AutoSubPipeline {
       filename: request.filename,
       streamFingerprint: streamFingerprint(request, stream),
       target,
-      geminiModel: this.config.gemini.model,
+      // A different engine produces a different translation, so cached ones
+      // must not be served after the operator switches backends.
+      translator: `${this.config.translation.provider}:${this.config.translation.model}`,
     });
   }
 
@@ -417,7 +419,7 @@ export class AutoSubPipeline {
       summary("failed");
       throw new TranslationRequiredError(languageName(target));
     }
-    console.log(`No direct ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.config.gemini.model}`);
+    console.log(`No direct ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.translator.name} (${this.config.translation.model})`);
     const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
     const result = await this.store({
       key,
@@ -425,18 +427,18 @@ export class AutoSubPipeline {
       language: target,
       content: serializeSrt(translated),
       confidence: source.confidence,
-      provider: `${source.ranked.candidate.provider}+gemini`,
+      provider: `${source.ranked.candidate.provider}+${this.translator.name}`,
       translated: true,
       sourceLanguage,
     });
     const usage = this.translator.lastUsage;
     summary("translated", result, {
       cues: referenceCues.length,
-      characters: referenceCues.reduce((total, cue) => total + cue.text.length, 0),
+      characters: usage?.characters ?? 0,
       promptTokens: usage?.promptTokens,
       responseTokens: usage?.responseTokens,
     });
-    console.log(`Translated ${referenceCues.length} cues to ${target}; tokens in=${usage?.promptTokens ?? "?"} out=${usage?.responseTokens ?? "?"}`);
+    console.log(`Translated ${referenceCues.length} cues to ${target} with ${this.translator.name}; characters=${usage?.characters ?? "?"} tokensIn=${usage?.promptTokens ?? "-"} tokensOut=${usage?.responseTokens ?? "-"}`);
     return result;
   }
 

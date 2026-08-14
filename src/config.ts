@@ -42,6 +42,15 @@ export interface AppConfig {
    * asks for it from the subtitle menu, `off` never.
    */
   translationMode: "auto" | "manual" | "off";
+  translation: {
+    /** Which backend performs the translation when one is asked for. */
+    provider: "gemini" | "openai" | "deepl" | "libretranslate";
+    apiKey?: string;
+    /** Endpoint for OpenAI-compatible and self-hosted backends. */
+    baseUrl?: string;
+    model: string;
+    concurrency: number;
+  };
   gemini: { apiKey?: string; model: string; concurrency: number };
   deepgram: { apiKey?: string; model: string };
   openSubtitles: {
@@ -55,6 +64,12 @@ export interface AppConfig {
 }
 
 export const INSECURE_TOKEN = "change-me-before-exposing";
+
+const PROVIDERS = ["gemini", "openai", "deepl", "libretranslate"] as const;
+type TranslationProvider = (typeof PROVIDERS)[number];
+
+const asProvider = (value: string | undefined): TranslationProvider =>
+  (PROVIDERS as readonly string[]).includes(value || "") ? (value as TranslationProvider) : "gemini";
 
 const asNumber = (value: string | undefined, fallback: number, minimum: number, maximum: number): number => {
   const parsed = Number.parseFloat(value ?? "");
@@ -106,6 +121,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     statusProbeMs: asInt(env.STATUS_PROBE_MS, 2_000, 0, 15_000),
     streamWaitMs: asInt(env.STREAM_WAIT_MS, 12_000, 100, 60_000),
     tmdbToken: env.TMDB_API_TOKEN,
+    translation: {
+      provider: asProvider(env.TRANSLATION_PROVIDER),
+      apiKey: env.TRANSLATION_API_KEY || (asProvider(env.TRANSLATION_PROVIDER) === "gemini" ? env.GEMINI_API_KEY : undefined),
+      baseUrl: env.TRANSLATION_BASE_URL,
+      model: env.TRANSLATION_MODEL || env.GEMINI_MODEL || "gemini-3.5-flash",
+      concurrency: asInt(env.TRANSLATION_CONCURRENCY, 2, 1, 8),
+    },
     gemini: {
       apiKey: env.GEMINI_API_KEY,
       model: env.GEMINI_MODEL || "gemini-3.5-flash",
@@ -126,6 +148,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
 }
 
+/** Whether the selected translation backend has everything it needs. */
+export function translationConfigured(config: AppConfig): boolean {
+  const { provider, apiKey, baseUrl } = config.translation;
+  if (provider === "openai" || provider === "libretranslate") return Boolean(baseUrl);
+  return Boolean(apiKey);
+}
+
 /** Startup problems worth telling the operator about, in severity order. */
 export function configWarnings(config: AppConfig): string[] {
   const warnings: string[] = [];
@@ -137,7 +166,9 @@ export function configWarnings(config: AppConfig): string[] {
   if (!config.upstreamAddonUrl) warnings.push("UPSTREAM_ADDON_URL is unset; AutoSub will return no streams");
   if (!config.publicUrl.startsWith("https://")) warnings.push(`PUBLIC_URL is not HTTPS (${config.publicUrl}); Stremio clients may refuse to install the addon`);
   if (!config.audioAnalysisEnabled) warnings.push("AUDIO_ANALYSIS_ENABLED=false; subtitles cannot be validated and every request will fail");
-  if (!config.gemini.apiKey && config.translationMode !== "off") warnings.push("GEMINI_API_KEY is unset; translation fallback is disabled");
+  if (config.translationMode !== "off" && !translationConfigured(config)) {
+    warnings.push(`Translation provider "${config.translation.provider}" is not fully configured; translation is unavailable`);
+  }
   if (!config.deepgram.apiKey) warnings.push("DEEPGRAM_API_KEY is unset; falling back to speech-activity matching only");
   return warnings;
 }

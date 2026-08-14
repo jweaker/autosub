@@ -61,7 +61,7 @@ Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` 
 5. **Candidate search.** OpenSubtitles, SubDL, and SubSource are searched concurrently and the results ranked by hash match, release-name similarity, source, group, edition, and frame rate.
 6. **Validation.** Candidates are downloaded in waves — the best entry from each provider at a time — and scored against the speech timeline. A global model corrects constant delay and constrained frame-rate drift (50 ms / 0.01% precision). Anything that only fits in places is rejected.
 7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. A source track that no candidate can align to is discarded and the next best one tried, because a subtitle cut for a different edit can match the audio and still be a useless reference.
-8. **Translation, only if asked.** When no candidate matches any trusted track, AutoSub says so and offers a translation from the subtitle menu. Gemini then translates the corrected source text under a fixed schema; timestamps never leave this process. Set `TRANSLATION_MODE=auto` to have it happen unprompted, or `off` to disable it.
+8. **Translation, only if asked.** When no candidate matches any trusted track, AutoSub says so and offers a translation from the subtitle menu. The chosen engine then translates the corrected source text; timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. Set `TRANSLATION_MODE=auto` to have it happen unprompted, or `off` to disable it. See [docs/translation.md](docs/translation.md) for choosing an engine.
 9. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
 
 If nothing passes, AutoSub says so rather than serving a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
@@ -139,6 +139,7 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `RETRY_ENTRIES` | `3` | How many "try another" rows, each usable once per playback |
 | `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
 | `TRANSLATION_MODE` | `manual` | `manual` offers translation in the menu, `auto` runs it unprompted, `off` disables it |
+| `TRANSLATION_PROVIDER` | `gemini` | `gemini`, `openai` (any chat-completions endpoint), `deepl`, or `libretranslate` |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
 
@@ -171,6 +172,7 @@ No provider credentials are needed for the test suite; network calls and media t
 
 - [docs/architecture.md](docs/architecture.md) — module map, request lifecycle, design decisions
 - [docs/deployment.md](docs/deployment.md) — Raspberry Pi, Cloudflare Tunnel, and every API key
+- [docs/translation.md](docs/translation.md) — choosing and configuring a translation engine
 - [docs/tuning.md](docs/tuning.md) — how confidence is computed and how to adjust matching
 - [docs/operations.md](docs/operations.md) — health, logs, status codes, troubleshooting
 - [SECURITY.md](SECURITY.md) — trust boundaries and reporting

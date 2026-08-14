@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import type { AppConfig } from "./config.js";
+import { translationConfigured, type AppConfig } from "./config.js";
 import type { CompletedSubtitle, StreamRecord, SubtitleProvider, SubtitleRequest } from "./domain.js";
 import { HttpError } from "./http.js";
 import { JobExpiredError, type JobManager, JobTimeoutError } from "./jobs.js";
@@ -44,7 +44,7 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.6.0",
+  version: "1.7.0",
   name: "AutoSub",
   description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback",
   resources: [
@@ -132,7 +132,9 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       upstream: upstream.enabled,
       audioAnalysis: config.audioAnalysisEnabled,
       providers: providers.map((provider) => provider.name),
-      translation: config.gemini.apiKey ? "gemini" : "disabled",
+      translation: translationConfigured(config) && config.translationMode !== "off"
+        ? { provider: config.translation.provider, mode: config.translationMode }
+        : "disabled",
       languageDetectionFallback: config.deepgram.apiKey ? "deepgram" : "metadata-only",
       jobs: { tracked: jobs.size, running: jobs.running },
       uptimeSeconds: Math.round(process.uptime()),
@@ -243,7 +245,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     }
     // Translation costs money per title, so in manual mode it is an explicit
     // choice rather than something that happens on the viewer's behalf.
-    if (config.translationMode === "manual" && config.gemini.apiKey) {
+    if (config.translationMode === "manual" && translationConfigured(config)) {
       entries.push({
         id: `autosub-translate-${jobId}`,
         url: fileUrl(`translate/${jobId}.srt`),

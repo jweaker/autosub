@@ -33,7 +33,7 @@ Two consequences follow from that decision, and they explain most of the code:
 | `providers/` | OpenSubtitles, SubDL, SubSource clients |
 | `subtitle-content.ts` | Unzip, encoding detection, ASS/VTT → SRT |
 | `srt.ts` | SRT parse and serialize |
-| `translation.ts` | Gemini translation under a fixed cue schema |
+| `translation/` | Pluggable translation backends behind one interface |
 | `cache.ts` | Finished subtitles on disk, keyed by release fingerprint |
 | `http.ts` | One timeout/retry/backoff policy for every outbound call |
 | `metadata.ts` | TMDB original-language lookup |
