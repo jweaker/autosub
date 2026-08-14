@@ -138,13 +138,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       apiKey: env.TRANSLATION_API_KEY || (asProvider(env.TRANSLATION_PROVIDER) === "gemini" ? env.GEMINI_API_KEY : undefined),
       baseUrl: env.TRANSLATION_BASE_URL,
       model: env.TRANSLATION_MODEL || env.GEMINI_MODEL || "gemini-3.5-flash",
-      concurrency: asInt(env.TRANSLATION_CONCURRENCY, 2, 1, 8),
+      concurrency: asInt(env.TRANSLATION_CONCURRENCY, 4, 1, 12),
       timeoutMs: asInt(env.TRANSLATION_TIMEOUT_MS, 120_000, 10_000, 600_000),
     },
     gemini: {
       apiKey: env.GEMINI_API_KEY,
       model: env.GEMINI_MODEL || "gemini-3.5-flash",
-      concurrency: asInt(env.TRANSLATION_CONCURRENCY, 2, 1, 8),
+      concurrency: asInt(env.TRANSLATION_CONCURRENCY, 4, 1, 12),
     },
     deepgram: {
       apiKey: env.DEEPGRAM_API_KEY,
@@ -183,5 +183,8 @@ export function configWarnings(config: AppConfig): string[] {
     warnings.push(`Translation provider "${config.translation.provider}" is not fully configured; translation is unavailable`);
   }
   if (!config.deepgram.apiKey) warnings.push("DEEPGRAM_API_KEY is unset; falling back to speech-activity matching only");
+  if (config.translationMode !== "off" && config.translation.concurrency === 1) {
+    warnings.push("TRANSLATION_CONCURRENCY=1 makes feature-film translation sequential and slow; use 4 when the endpoint quota allows it");
+  }
   return warnings;
 }

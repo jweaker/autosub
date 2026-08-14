@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSrt, serializeSrt } from "../src/srt.js";
+import { parseSrt, serializeSrt, stabilizeCues } from "../src/srt.js";
 
 describe("SRT parsing", () => {
   it("round trips multilingual cues", () => {
@@ -43,5 +43,68 @@ describe("SRT parsing", () => {
 
   it("rejects a file with no cues at all", () => {
     expect(() => parseSrt("not a subtitle")).toThrow(/no parseable cues/);
+  });
+});
+
+describe("cue stabilization", () => {
+  it("merges overlapping duplicate cues instead of flashing them twice", () => {
+    const result = stabilizeCues([
+      { id: 1, startMs: 1_000, endMs: 2_000, text: "  مرحبا  " },
+      { id: 2, startMs: 1_950, endMs: 3_000, text: "مرحبا" },
+    ]);
+    expect(result.cues).toEqual([{ id: 1, startMs: 1_000, endMs: 3_000, text: "مرحبا" }]);
+    expect(result.merged).toBe(1);
+  });
+
+  it("merges identical captions separated by a sub-frame playback gap", () => {
+    const result = stabilizeCues([
+      { id: 1, startMs: 1_000, endMs: 2_000, text: "نفس السطر" },
+      { id: 2, startMs: 2_200, endMs: 3_200, text: "نفس السطر" },
+    ]);
+    expect(result.cues).toEqual([{ id: 1, startMs: 1_000, endMs: 3_200, text: "نفس السطر" }]);
+    expect(result.merged).toBe(1);
+  });
+
+  it("merges duplicate and progressive captions even when another overlay sits between them", () => {
+    const result = stabilizeCues([
+      { id: 1, startMs: 1_000, endMs: 3_000, text: "Hello" },
+      { id: 2, startMs: 1_050, endMs: 2_000, text: "[door opens]" },
+      { id: 3, startMs: 1_080, endMs: 3_500, text: "Hello" },
+      { id: 4, startMs: 5_000, endMs: 6_000, text: "How" },
+      { id: 5, startMs: 5_050, endMs: 7_000, text: "How are you?" },
+    ]);
+    expect(result.cues.map((cue) => cue.text)).toEqual(["Hello", "[door opens]", "How are you?"]);
+    expect(result.merged).toBe(2);
+  });
+
+  it("drops one-frame junk and extends short readable cues when space permits", () => {
+    const result = stabilizeCues([
+      { id: 1, startMs: 1_000, endMs: 1_080, text: "flash" },
+      { id: 2, startMs: 2_000, endMs: 2_250, text: "kept" },
+      { id: 3, startMs: 4_000, endMs: 5_000, text: "next" },
+    ]);
+    expect(result.cues.map((cue) => cue.text)).toEqual(["kept", "next"]);
+    expect(result.cues[0].endMs - result.cues[0].startMs).toBe(500);
+  });
+
+  it("keeps meaningful multi-speaker overlaps", () => {
+    const result = stabilizeCues([
+      { id: 1, startMs: 1_000, endMs: 3_000, text: "- First speaker" },
+      { id: 2, startMs: 2_000, endMs: 4_000, text: "- Second speaker" },
+    ]);
+    expect(result.cues).toHaveLength(2);
+    expect(result.cues[0].endMs).toBe(3_000);
+  });
+
+  it("removes control-only cues and returns chronological ids", () => {
+    const result = stabilizeCues([
+      { id: 9, startMs: 4_000, endMs: 5_000, text: "later" },
+      { id: 8, startMs: 1_000, endMs: 2_000, text: "\u0000\u200b" },
+      { id: 7, startMs: 2_000, endMs: 3_000, text: "earlier" },
+    ]);
+    expect(result.cues.map(({ id, text }) => ({ id, text }))).toEqual([
+      { id: 1, text: "earlier" },
+      { id: 2, text: "later" },
+    ]);
   });
 });

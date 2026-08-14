@@ -10,6 +10,7 @@ interface Job {
   request: SubtitleRequest;
   stream: StreamRecord;
   language: string;
+  translationRequested: boolean;
   promise: Promise<CompletedSubtitle>;
   createdAt: number;
   state: "preparing" | "ready" | "failed";
@@ -84,13 +85,16 @@ export class JobManager {
       request,
       stream,
       language,
+      translationRequested: translate,
       promise: this.pipeline.complete(request, stream, language, exclude, translate),
       createdAt: Date.now(),
       state: "preparing",
     };
     this.jobs.set(id, job);
     this.byKey.set(key, id);
-    this.byRelease.set(releaseKey, id);
+    // A forced AI version is an alternative chosen from its own menu row. It
+    // must not silently replace the normal subtitle or its retry chain.
+    if (!translate) this.byRelease.set(releaseKey, id);
     void job.promise.then(
       (result) => {
         job.state = "ready";
@@ -136,6 +140,7 @@ export class JobManager {
   private current(id: string): Job | undefined {
     const job = this.jobs.get(id);
     if (!job) return undefined;
+    if (job.translationRequested) return job;
     const latest = this.byRelease.get(job.releaseKey);
     return (latest && this.jobs.get(latest)) || job;
   }
@@ -190,8 +195,14 @@ export class JobManager {
       throw new JobTimeoutError(timeoutMs);
     }
 
+    const fingerprints = [
+      snapshot.result.id,
+      snapshot.result.sourceContentHash || snapshot.result.contentHash
+        ? `content:${snapshot.result.sourceContentHash || snapshot.result.contentHash}`
+        : undefined,
+    ].filter((value): value is string => Boolean(value));
     const exclude = this.rejections
-      ? await this.rejections.add(job.releaseKey, snapshot.result.id)
+      ? await this.rejections.addMany(job.releaseKey, fingerprints)
       : [snapshot.result.id];
     console.log(`Rejected ${snapshot.result.id} for ${job.request.contentId} (${job.language}); trying the next candidate`);
     const nextId = this.start(job.request, job.stream, job.language, exclude);

@@ -305,13 +305,49 @@ function searchMapping(
   const maximumRate = Math.min(1.06, coarseBest.rate + fine.rateSpan);
   const minimumOffset = Math.max(-maxOffsetMs, coarseBest.offsetMs - fine.offsetSpan);
   const maximumOffset = Math.min(maxOffsetMs, coarseBest.offsetMs + fine.offsetSpan);
-  for (let rate = minimumRate; rate <= maximumRate + 0.00001; rate += fine.rateStep) {
+  if (Math.abs(coarseBest.rate - 1) > 0.01) {
+    // A real frame-rate conversion couples rate and offset over the full title;
+    // keep the exhaustive fine grid for this uncommon but important case.
+    for (let rate = minimumRate; rate <= maximumRate + 0.00001; rate += fine.rateStep) {
+      for (let offsetMs = minimumOffset; offsetMs <= maximumOffset; offsetMs += FINE_OFFSET_STEP_MS) {
+        const { score } = evaluator(offsetMs, rate);
+        refined.push({ offsetMs, rate, score });
+      }
+    }
+    const chosen = select(refined, 0) || coarseBest;
+    const best = evaluator(chosen.offsetMs, chosen.rate);
+    const distribution = coarse.map((placement) => placement.score).sort((left, right) => left - right);
+    const baseline = distribution[Math.floor(distribution.length * 0.75)] || 0;
+    return { best, distinctiveness: Math.max(0, best.score - baseline) };
+  }
+  // Rate and offset are locally smooth but evaluating their full Cartesian
+  // product costs roughly two thousand whole-title comparisons per candidate.
+  // Two coordinate-descent passes find the same basin, then a tiny joint grid
+  // resolves their interaction. This cuts the hot path by about an order of
+  // magnitude without coarsening either the 50 ms or 0.01% resolution.
+  let current = coarseBest;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const offsets: Placement[] = [];
     for (let offsetMs = minimumOffset; offsetMs <= maximumOffset; offsetMs += FINE_OFFSET_STEP_MS) {
+      const { score } = evaluator(offsetMs, current.rate);
+      offsets.push({ offsetMs, rate: current.rate, score });
+    }
+    current = select(offsets, 0) || current;
+
+    const rates: Placement[] = [];
+    for (let rate = minimumRate; rate <= maximumRate + 0.00001; rate += fine.rateStep) {
+      const { score } = evaluator(current.offsetMs, rate);
+      rates.push({ offsetMs: current.offsetMs, rate, score });
+    }
+    current = select(rates, 0) || current;
+  }
+  for (let rate = Math.max(minimumRate, current.rate - fine.rateStep * 2); rate <= Math.min(maximumRate, current.rate + fine.rateStep * 2) + 0.00001; rate += fine.rateStep) {
+    for (let offsetMs = Math.max(minimumOffset, current.offsetMs - 100); offsetMs <= Math.min(maximumOffset, current.offsetMs + 100); offsetMs += FINE_OFFSET_STEP_MS) {
       const { score } = evaluator(offsetMs, rate);
       refined.push({ offsetMs, rate, score });
     }
   }
-  const chosen = select(refined, 0) || coarseBest;
+  const chosen = select(refined, 0) || current;
   const best = evaluator(chosen.offsetMs, chosen.rate);
 
   const distribution = coarse.map((placement) => placement.score).sort((left, right) => left - right);

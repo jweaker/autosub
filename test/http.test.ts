@@ -43,6 +43,19 @@ describe("outbound requests", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("does not immediately retry a quota with a long Retry-After", async () => {
+    const fetchMock = vi.fn(async () => new Response("daily quota exhausted", {
+      status: 429,
+      headers: { "retry-after": "14400" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(request("https://example.test/x", { label: "Provider" })).rejects.toMatchObject({
+      status: 429,
+      retryAfterMs: 14_400_000,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("stops immediately when the caller aborts", async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn(async () => {

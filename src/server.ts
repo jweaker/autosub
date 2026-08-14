@@ -24,7 +24,7 @@ const rejections = new RejectionStore(config.dataDir);
 await rejections.load();
 const pipeline = new AutoSubPipeline(config, providers, cache);
 const jobs = new JobManager(pipeline, rejections);
-const app = createApp({ config, registry, upstream, jobs, providers, pipeline });
+const app = createApp({ config, registry, upstream, jobs, providers, pipeline, cache });
 
 const server = app.listen(config.port, "0.0.0.0", () => {
   console.log(`AutoSub listening on port ${config.port}`);

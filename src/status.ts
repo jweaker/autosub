@@ -20,8 +20,10 @@ export function resultLabel(result: CompletedSubtitle): string {
     : `AutoSub: found on ${result.provider} (${result.confidence}%)`;
 }
 
-export function failedLabel(): string {
-  return "AutoSub: nothing matched this release";
+export function failedLabel(translationAvailable = false): string {
+  return translationAvailable
+    ? "AutoSub: no direct match - AI translation available"
+    : "AutoSub: nothing matched this release";
 }
 
 /**
@@ -37,7 +39,7 @@ export function retryLabel(language: string, attempt = 1): string {
 }
 
 export function translateLabel(language: string): string {
-  return `${languageName(language)} - AI translate, uses credits (AutoSub)`;
+  return `${languageName(language)} - force AI translation, uses credits (AutoSub)`;
 }
 
 export function translationOfferTrack(language: string): string {
@@ -93,9 +95,10 @@ export function preparingTrack(language: string): string {
 }
 
 export function failureTrack(reason: string): string {
+  const concise = reason.replace(/\s+/g, " ").slice(0, 180);
   return noticeTrack([
     "[AutoSub] No subtitle passed audio validation for this release.",
-    reason,
+    concise,
   ]);
 }
 

@@ -27,6 +27,17 @@ export function rankCandidate(request: SubtitleRequest, candidate: SubtitleCandi
     }
   }
 
+  const videoRemux = /\b(?:bdremux|remux)\b/.test(video?.normalized || "");
+  const subtitleRemux = /\b(?:bdremux|remux)\b/.test(subtitle?.normalized || "");
+  if (videoRemux) {
+    if (subtitleRemux) {
+      score += 15;
+      reasons.push("same remux cut family");
+    } else {
+      score -= 12;
+    }
+  }
+
   if (video?.group && subtitle?.group && video.group === subtitle.group) {
     score += 18;
     reasons.push("same release group");

@@ -25,6 +25,7 @@ const REQUEST_TIMEOUT_MS = 45_000;
 abstract class ArrayTranslator implements Translator {
   abstract readonly name: string;
   lastUsage?: TranslationUsage;
+  private readonly usages = new WeakMap<SubtitleCue[], TranslationUsage>();
 
   constructor(protected readonly settings: MachineSettings) {}
 
@@ -39,8 +40,15 @@ abstract class ArrayTranslator implements Translator {
       if (results.length !== batch.length) throw new Error(`${this.name} returned ${results.length}/${batch.length} translations`);
       return new Map(batch.map((cue, index) => [cue.id, results[index].trim() || cue.text]));
     });
-    this.lastUsage = { characters: countCharacters(cues) };
-    return cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
+    const usage = { characters: countCharacters(cues) };
+    const result = cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
+    this.lastUsage = usage;
+    this.usages.set(result, usage);
+    return result;
+  }
+
+  usageFor(result: SubtitleCue[]): TranslationUsage | undefined {
+    return this.usages.get(result);
   }
 }
 

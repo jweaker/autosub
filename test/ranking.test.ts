@@ -74,6 +74,18 @@ describe("release parsing", () => {
     });
   });
 
+  it("recognizes compact BDRemux names used by UHD releases", () => {
+    expect(parseRelease("MUFASA.2024.2160p.UHD.BDRemux.HDR.DV.HEVC-Нечипорук.mkv")?.source).toBe("bluray");
+  });
+
+  it("prefers a remux timing track over a generic Blu-ray encode for a remux video", () => {
+    const remuxRequest = { ...request, filename: "Movie.2024.2160p.UHD.BDRemux.HDR.DV.mkv" };
+    const remux = rankCandidate(remuxRequest, candidate({ release: "Movie.2024.1080p.Blu-ray.Remux.AVC-HDT" }));
+    const encode = rankCandidate(remuxRequest, candidate({ release: "Movie.2024.1080p.BluRay.x264-KNiVES" }));
+    expect(remux.score).toBeGreaterThan(encode.score);
+    expect(remux.reasons).toContain("same remux cut family");
+  });
+
   it("ignores quality tokens when comparing names", () => {
     const similarity = tokenSimilarity("Movie.2024.1080p.x265-GROUP.mkv", "Movie.2024.2160p.x264-GROUP");
     expect(similarity).toBeGreaterThan(0.7);

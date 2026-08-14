@@ -3,6 +3,20 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/p
 import { join } from "node:path";
 import type { CompletedSubtitle } from "./domain.js";
 
+export interface CachedSubtitleInfo {
+  key: string;
+  id: string;
+  contentId?: string;
+  release?: string;
+  language: string;
+  provider: string;
+  confidence: number;
+  translated: boolean;
+  sourceLanguage?: string;
+  cachedAt: string;
+  bytes: number;
+}
+
 export function stableKey(parts: unknown): string {
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
@@ -57,6 +71,62 @@ export class SubtitleCache {
       await Promise.all([rm(temporary.subtitle, { force: true }), rm(temporary.metadata, { force: true })]);
       throw error;
     }
+  }
+
+  /** Metadata-only inventory for the authenticated operator dashboard. */
+  async list(): Promise<CachedSubtitleInfo[]> {
+    try {
+      const names = await readdir(this.root);
+      const entries = await Promise.all(names
+        .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+        .map(async (name): Promise<CachedSubtitleInfo | undefined> => {
+          const key = name.slice(0, -5);
+          const paths = this.paths(key);
+          try {
+            const [raw, metadataInfo, subtitleInfo] = await Promise.all([
+              readFile(paths.metadata, "utf8"),
+              stat(paths.metadata),
+              stat(paths.subtitle),
+            ]);
+            const metadata = JSON.parse(raw) as Omit<CompletedSubtitle, "content">;
+            return {
+              key,
+              id: metadata.id,
+              contentId: metadata.contentId,
+              release: metadata.release,
+              language: metadata.language,
+              provider: metadata.provider,
+              confidence: metadata.confidence,
+              translated: metadata.translated,
+              sourceLanguage: metadata.sourceLanguage,
+              cachedAt: metadata.cachedAt || metadataInfo.mtime.toISOString(),
+              bytes: metadataInfo.size + subtitleInfo.size,
+            };
+          } catch {
+            // Ignore half-written, corrupt, or concurrently removed entries.
+            return undefined;
+          }
+        }));
+      return entries
+        .filter((entry): entry is CachedSubtitleInfo => Boolean(entry))
+        .sort((left, right) => Date.parse(right.cachedAt) - Date.parse(left.cachedAt));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.warn("Subtitle cache listing failed:", error);
+      return [];
+    }
+  }
+
+  /** Removes only explicit, validated cache keys. */
+  async removeMany(keys: string[]): Promise<number> {
+    const unique = [...new Set(keys)].filter((key) => /^[a-f0-9]{64}$/.test(key)).slice(0, 200);
+    let removed = 0;
+    await Promise.all(unique.map(async (key) => {
+      const paths = this.paths(key);
+      const existing = await Promise.allSettled([stat(paths.subtitle), stat(paths.metadata)]);
+      if (existing.some((item) => item.status === "fulfilled")) removed += 1;
+      await Promise.all([rm(paths.subtitle, { force: true }), rm(paths.metadata, { force: true })]);
+    }));
+    return removed;
   }
 
   /** Drops entries older than `maxAgeMs` so the data volume cannot grow without bound. */

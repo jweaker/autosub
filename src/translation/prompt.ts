@@ -8,10 +8,15 @@ import { languageName } from "../languages.js";
  * silently shifting every line onto the wrong timestamp.
  */
 export function translationPrompt(batch: SubtitleCue[], source: string, target: string): string {
+  const targetGuidance = target.split(/[-_]/)[0].toLowerCase() === "ar"
+    ? "Use natural Modern Standard Arabic suitable for film subtitles. Preserve tone, gender, names, jokes, and dramatic intent; avoid word-for-word calques and unnecessary transliteration."
+    : `Write idiomatic ${languageName(target)}, preserving tone and dramatic intent rather than translating word for word.`;
   return [
     `Translate subtitle dialogue from ${languageName(source)} to ${languageName(target)}.`,
     "Return a JSON array where every cue appears exactly once with its unchanged numeric id.",
     "Translate naturally for on-screen subtitles, using concise lines.",
+    targetGuidance,
+    "Read neighbouring cues as one scene so pronouns, gender, names, and sentence fragments remain consistent.",
     "Preserve speaker dashes, basic HTML/italics tags, names, intentional line breaks, and bracketed sound descriptions. Do not add commentary.",
     `Cues: ${JSON.stringify(batch.map(({ id, text }) => ({ id, text })))}`,
   ].join("\n");

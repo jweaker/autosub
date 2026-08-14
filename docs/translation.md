@@ -1,6 +1,6 @@
 # Translation
 
-Translation is the fallback of last resort: it runs only when no subtitle in the target language could be validated against the audio, and only when asked for (`TRANSLATION_MODE=manual`, the default). The cheapest translation is the one that never happens, so improving matching — `REFERENCE_LANGUAGES`, `CANDIDATE_LIMIT`, `MINIMUM_CONFIDENCE` — beats optimising the engine.
+Translation is normally the fallback of last resort and only runs when asked for (`TRANSLATION_MODE=manual`, the default). The subtitle menu also exposes an explicit `force AI translation` row. Selecting it always generates an AI version from a validated source-language timing track, even when AutoSub already found a working target-language subtitle. The forced and direct variants are cached separately, so the paid alternative never replaces the normal row. The cheapest translation is still the one that never happens, so use the override deliberately.
 
 A feature film is roughly 1,200–1,600 cues and 60–80k characters. That figure is what every option below should be judged against, and `/stats` reports it per run alongside the tokens actually charged.
 
@@ -39,15 +39,24 @@ TRANSLATION_PROVIDER=openai
 TRANSLATION_BASE_URL=https://your-gateway.example/v1
 TRANSLATION_API_KEY=...
 TRANSLATION_MODEL=your-model
-TRANSLATION_CONCURRENCY=2
+TRANSLATION_CONCURRENCY=4
 TRANSLATION_TIMEOUT_MS=180000
 ```
 
 Reasoning models are slow enough to matter here: measured at roughly 27 seconds
-per 80-cue batch, a feature film takes about four minutes at a concurrency of
-two. That is longer than `JOB_WAIT_MS`, so the first request returns the
+per 60-cue batch, a feature film can still take several minutes. Batches run at
+a concurrency of four by default, cutting the critical path to roughly a
+quarter of sequential time when the endpoint has capacity. That may still be
+longer than `JOB_WAIT_MS`, so the first request returns the
 "still preparing" notice and the subtitle appears when the row is selected
-again. Raise `TRANSLATION_CONCURRENCY` only as far as the endpoint allows.
+again. Set `TRANSLATION_CONCURRENCY` to what the endpoint allows (1–12).
+
+Language-model batches are intentionally moderate rather than enormous: a
+truncated or malformed batch is retried in smaller halves instead of failing
+the entire title. Every complete result is also checked for cue identity and
+for a model that mostly echoed the source. Arabic prompts explicitly request
+concise, natural Modern Standard Arabic with consistent gender, names, tone,
+and scene context rather than literal line-by-line wording.
 
 A model running on your own machine, where the only cost is electricity:
 
@@ -90,7 +99,7 @@ Watch `/stats` after a translation:
 
 ## Switching engines
 
-The cache key includes the provider and model, so changing either invalidates previously translated subtitles without touching directly matched ones. Nothing needs clearing by hand.
+The cache key includes the provider, model, and whether AI was explicitly forced. Direct and forced subtitles therefore coexist for the same release, while choosing the force row again reuses the already generated result. Nothing needs clearing by hand.
 
 ## What never changes
 

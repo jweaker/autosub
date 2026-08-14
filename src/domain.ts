@@ -62,6 +62,9 @@ export interface AudioProbeResult {
   /** Sample length actually used, which adapts to the release's bitrate. */
   sampleSeconds?: number;
   megabitsPerSecond?: number;
+  /** Exact Deepgram request count and submitted audio for this probe. */
+  deepgramRequests?: number;
+  deepgramSeconds?: number;
 }
 
 export interface AlignmentResult {
@@ -86,6 +89,16 @@ export interface CompletedSubtitle {
   provider: string;
   translated: boolean;
   sourceLanguage?: string;
+  /** Stable fingerprint used to avoid serving the same file again under a
+   * different provider id. */
+  contentHash?: string;
+  /** For translations, the source timing/text fingerprint that must be barred
+   * when the viewer rejects the generated result. */
+  sourceContentHash?: string;
+  /** Operator-facing cache metadata; never sent to subtitle providers. */
+  contentId?: string;
+  release?: string;
+  cachedAt?: string;
 }
 
 export interface ReleaseSignature {

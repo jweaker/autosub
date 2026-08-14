@@ -1,6 +1,8 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
+import type { SubtitleCache } from "./cache.js";
 import { translationConfigured, type AppConfig } from "./config.js";
+import { renderDashboard } from "./dashboard.js";
 import type { CompletedSubtitle, StreamRecord, SubtitleProvider, SubtitleRequest } from "./domain.js";
 import { HttpError } from "./http.js";
 import { JobExpiredError, type JobManager, JobTimeoutError } from "./jobs.js";
@@ -29,6 +31,7 @@ export interface AppDependencies {
   upstream: UpstreamStreamAddon;
   jobs: JobManager;
   providers: SubtitleProvider[];
+  cache: Pick<SubtitleCache, "list" | "removeMany">;
   /** Source of the recent-run summaries served by /stats. */
   pipeline: Pick<AutoSubPipeline, "recentRuns">;
 }
@@ -44,9 +47,9 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.15.0",
+  version: "1.16.0",
   name: "AutoSub",
-  description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback",
+  description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback and override",
   resources: [
     { name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] },
     { name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt"] },
@@ -74,7 +77,7 @@ function statusFor(error: unknown): number {
  * stub dependencies in tests, which is the only way to check what a player
  * actually receives without a TV in the loop.
  */
-export function createApp({ config, registry, upstream, jobs, providers, pipeline }: AppDependencies): Express {
+export function createApp({ config, registry, upstream, jobs, providers, pipeline, cache }: AppDependencies): Express {
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
@@ -110,6 +113,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
   });
 
   const expectedToken = Buffer.from(config.installToken);
+  const cacheActionToken = randomBytes(24).toString("base64url");
 
   function authorized(request: Request, response: Response, next: NextFunction): void {
     const provided = Buffer.from(String(request.params.token || ""));
@@ -133,7 +137,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       audioAnalysis: config.audioAnalysisEnabled,
       providers: providers.map((provider) => provider.name),
       translation: translationConfigured(config) && config.translationMode !== "off"
-        ? { provider: config.translation.provider, mode: config.translationMode }
+        ? { provider: config.translation.provider, mode: config.translationMode, concurrency: config.translation.concurrency }
         : "disabled",
       languageDetectionFallback: config.deepgram.apiKey ? "deepgram" : "metadata-only",
       jobs: { tracked: jobs.size, running: jobs.running },
@@ -149,7 +153,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     const manifestUrl = `${config.publicUrl}/${config.installToken}/manifest.json`;
     const installUrl = manifestUrl.replace(/^https?:\/\//, "stremio://");
     response.setHeader("Cache-Control", "no-store");
-    response.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width"><title>Install AutoSub</title><style>body{font:18px system-ui;max-width:46rem;margin:8vh auto;padding:1rem;background:#101216;color:#eee}a{display:inline-block;padding:.8rem 1rem;background:#7657ff;color:white;border-radius:.5rem;text-decoration:none}code{overflow-wrap:anywhere;color:#9ee}</style><h1>AutoSub</h1><p>Arabic is configured as the default. Keep this URL private because it grants access to your addon.</p><p><a href="${installUrl}">Install in Stremio</a></p><p><code>${manifestUrl}</code></p>`);
+    response.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width"><title>Install AutoSub</title><style>body{font:18px system-ui;max-width:46rem;margin:8vh auto;padding:1rem;background:#101216;color:#eee}a{display:inline-block;margin:.2rem .4rem .2rem 0;padding:.8rem 1rem;background:#286f67;color:white;border-radius:.5rem;text-decoration:none}code{overflow-wrap:anywhere;color:#9ee}</style><h1>AutoSub</h1><p>Arabic is configured as the default. Keep this URL private because it grants access to your addon.</p><p><a href="${installUrl}">Install in Stremio</a><a href="${config.publicUrl}/${config.installToken}/dashboard">Open operations</a></p><p><code>${manifestUrl}</code></p>`);
   });
 
   // Behind the token because it names the titles that were played.
@@ -157,6 +161,52 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     response.setHeader("Cache-Control", "no-store");
     response.json({ runs: pipeline.recentRuns() });
   });
+
+  app.get("/:token/dashboard", authorized, async (request, response, next) => {
+    try {
+      const query = String(request.query.q || "").slice(0, 160);
+      const rawCleared = Number.parseInt(String(request.query.cleared || ""), 10);
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+      response.type("html").send(renderDashboard({
+        config,
+        runs: pipeline.recentRuns(),
+        cache: await cache.list(),
+        providers: providers.map((provider) => provider.name),
+        jobs: { tracked: jobs.size, running: jobs.running },
+        uptimeSeconds: Math.round(process.uptime()),
+        basePath: `/${encodeURIComponent(config.installToken)}`,
+        csrfToken: cacheActionToken,
+        query,
+        cleared: Number.isFinite(rawCleared) && rawCleared >= 0 ? rawCleared : undefined,
+      }));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post(
+    "/:token/admin/cache",
+    authorized,
+    express.urlencoded({ extended: false, limit: "32kb" }),
+    async (request, response, next) => {
+      try {
+        const provided = Buffer.from(String(request.body.csrf || ""));
+        const expected = Buffer.from(cacheActionToken);
+        const valid = provided.length === expected.length && timingSafeEqual(provided, expected);
+        if (!valid || request.body.confirm !== "yes") {
+          response.status(400).type("text").send("Cache deletion confirmation is invalid. Refresh the dashboard and try again.");
+          return;
+        }
+        const submitted: unknown[] = Array.isArray(request.body.key) ? request.body.key : [request.body.key];
+        const keys = submitted.filter((key: unknown): key is string => typeof key === "string" && /^[a-f0-9]{64}$/.test(key));
+        const removed = await cache.removeMany(keys);
+        response.redirect(303, `/${encodeURIComponent(config.installToken)}/dashboard?cleared=${removed}#cache`);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   app.get("/:token/manifest.json", authorized, (_request, response) => {
     response.setHeader("Cache-Control", "public, max-age=300");
@@ -231,7 +281,11 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     if (snapshot?.state === "ready") {
       entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: resultLabel(snapshot.result) });
     } else if (snapshot?.state === "failed") {
-      entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: failedLabel() });
+      entries.push({
+        id: `autosub-status-${jobId}`,
+        url: fileUrl(`file/${jobId}.srt`),
+        lang: failedLabel(snapshot.error instanceof TranslationRequiredError && config.translationMode === "manual" && translationConfigured(config)),
+      });
     }
     // One row per attempt: each has its own URL, so a viewer can reject three
     // subtitles in a row without leaving the player. Selecting any of them

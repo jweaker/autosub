@@ -1,12 +1,13 @@
 import type { SubtitleCue } from "../domain.js";
 import { requestJson } from "../http.js";
 import { collectRows, parseRows, translationPrompt } from "./prompt.js";
-import { batchCues, countCharacters, runBatches, type TranslationUsage, type Translator } from "./types.js";
+import { assertTranslationChanged, batchCues, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
 export interface GeminiSettings {
   apiKey?: string;
   model: string;
   concurrency: number;
+  timeoutMs?: number;
 }
 
 interface GeminiResponse {
@@ -14,8 +15,8 @@ interface GeminiResponse {
   usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
 }
 
-const MAX_CUES_PER_BATCH = 120;
-const MAX_CHARACTERS_PER_BATCH = 24_000;
+const MAX_CUES_PER_BATCH = 72;
+const MAX_CHARACTERS_PER_BATCH = 12_000;
 const BATCH_TIMEOUT_MS = 60_000;
 const SCHEMA_ATTEMPTS = 2;
 
@@ -26,7 +27,7 @@ const SCHEMA_ATTEMPTS = 2;
 export class GeminiTranslator implements Translator {
   readonly name = "gemini";
   lastUsage?: TranslationUsage;
-  private usage: TranslationUsage = { characters: 0, promptTokens: 0, responseTokens: 0 };
+  private readonly usages = new WeakMap<SubtitleCue[], TranslationUsage>();
 
   constructor(private readonly settings: GeminiSettings) {}
 
@@ -34,7 +35,7 @@ export class GeminiTranslator implements Translator {
     return Boolean(this.settings.apiKey);
   }
 
-  private async translateBatch(batch: SubtitleCue[], source: string, target: string, signal?: AbortSignal): Promise<Map<number, string>> {
+  private async translateBatch(batch: SubtitleCue[], source: string, target: string, usage: TranslationUsage, signal?: AbortSignal): Promise<Map<number, string>> {
     const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.settings.model)}:generateContent`);
     let lastError: unknown;
 
@@ -46,7 +47,7 @@ export class GeminiTranslator implements Translator {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-goog-api-key": this.settings.apiKey || "" },
           signal,
-          timeoutMs: BATCH_TIMEOUT_MS,
+          timeoutMs: this.settings.timeoutMs ?? BATCH_TIMEOUT_MS,
           label: "Gemini translation",
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: translationPrompt(batch, source, target) }] }],
@@ -68,8 +69,8 @@ export class GeminiTranslator implements Translator {
           }),
         });
 
-        this.usage.promptTokens = (this.usage.promptTokens || 0) + (body.usageMetadata?.promptTokenCount || 0);
-        this.usage.responseTokens = (this.usage.responseTokens || 0) + (body.usageMetadata?.candidatesTokenCount || 0);
+        usage.promptTokens = (usage.promptTokens || 0) + (body.usageMetadata?.promptTokenCount || 0);
+        usage.responseTokens = (usage.responseTokens || 0) + (body.usageMetadata?.candidatesTokenCount || 0);
         const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
         return collectRows(batch, parseRows(text));
       } catch (error) {
@@ -82,10 +83,20 @@ export class GeminiTranslator implements Translator {
 
   async translate(cues: SubtitleCue[], source: string, target: string, signal?: AbortSignal): Promise<SubtitleCue[]> {
     if (!this.enabled) throw new Error("No Gemini API key is configured for subtitle translation");
-    this.usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
+    const usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
     const batches = batchCues(cues, MAX_CUES_PER_BATCH, MAX_CHARACTERS_PER_BATCH);
-    const translated = await runBatches(batches, this.settings.concurrency, (batch) => this.translateBatch(batch, source, target, signal));
-    this.lastUsage = { ...this.usage };
-    return cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
+    const translated = await runBatches(batches, this.settings.concurrency, (batch) => runBatchResiliently(
+      batch,
+      (part) => this.translateBatch(part, source, target, usage, signal),
+    ));
+    const result = cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
+    assertTranslationChanged(cues, result);
+    this.lastUsage = { ...usage };
+    this.usages.set(result, { ...usage });
+    return result;
+  }
+
+  usageFor(result: SubtitleCue[]): TranslationUsage | undefined {
+    return this.usages.get(result);
   }
 }

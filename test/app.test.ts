@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
+import { SubtitleCache } from "../src/cache.js";
 import { loadConfig } from "../src/config.js";
 import type { CompletedSubtitle, StreamRecord, SubtitleRequest } from "../src/domain.js";
 import { JobManager } from "../src/jobs.js";
@@ -39,6 +40,7 @@ let server: Server;
 let base: string;
 let registry: StreamRegistry;
 let jobs: JobManager;
+let cache: SubtitleCache;
 
 async function start(complete: AutoSubPipeline["complete"], environment: Record<string, string> = {}): Promise<void> {
   const dataDir = await mkdtemp(join(tmpdir(), "autosub-app-"));
@@ -53,6 +55,7 @@ async function start(complete: AutoSubPipeline["complete"], environment: Record<
   });
   registry = new StreamRegistry(join(dataDir, "streams.json"), config.publicUrl, config.installToken);
   jobs = new JobManager(stubPipeline(complete), new RejectionStore(dataDir));
+  cache = new SubtitleCache(dataDir);
   const app = createApp({
     config,
     registry,
@@ -60,6 +63,7 @@ async function start(complete: AutoSubPipeline["complete"], environment: Record<
     jobs,
     providers: [],
     pipeline: { recentRuns: () => [] },
+    cache,
   });
   server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
@@ -226,17 +230,35 @@ describe("addon HTTP surface", () => {
     const entries = await listSubtitles();
 
     const offer = entries.find((entry) => entry.url.includes("/translate/"));
-    expect(offer?.lang).toBe("Arabic - AI translate, uses credits (AutoSub)");
+    expect(offer?.lang).toBe("Arabic - force AI translation, uses credits (AutoSub)");
+    expect(entries[1].lang).toBe("AutoSub: no direct match - AI translation available");
 
     // The plain row explains the situation rather than silently spending.
     const plain = await fetch(local(entries[0].url));
     expect(plain.headers.get("x-autosub-state")).toBe("translation-offered");
-    expect(await plain.text()).toContain("AI translate");
+    expect(await plain.text()).toContain("AI translation");
     expect(complete).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), true);
 
     // Choosing it is what authorises the spend.
     const translated = await fetch(local(offer?.url as string));
     expect(translated.headers.get("x-autosub-translated")).toBe("true");
+  });
+
+  it("forces AI without replacing an already working normal subtitle", async () => {
+    const complete = vi.fn(async (_request, _stream, _language, _exclude: string[] = [], translate = false) =>
+      translate
+        ? subtitle({ translated: true, provider: "opensubtitles+openai", sourceLanguage: "en", id: "translated:opensubtitles:en" })
+        : subtitle());
+    await start(complete as unknown as AutoSubPipeline["complete"], { GEMINI_API_KEY: "k" });
+    await playStream();
+    const entries = await listSubtitles();
+    const normal = entries[0];
+    const force = entries.find((entry) => entry.url.includes("/translate/"));
+
+    expect((await fetch(local(normal.url))).headers.get("x-autosub-translated")).toBe("false");
+    expect((await fetch(local(force?.url as string))).headers.get("x-autosub-translated")).toBe("true");
+    expect(complete).toHaveBeenCalledWith(expect.anything(), expect.anything(), "ar", [], true);
+    expect((await fetch(local(normal.url))).headers.get("x-autosub-translated")).toBe("false");
   });
 
   it("hides the translation row when no model is configured", async () => {
@@ -298,6 +320,39 @@ describe("addon HTTP surface", () => {
     const response = await fetch(`${base}/${TOKEN}/stats`);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ runs: [] });
+  });
+
+  it("renders an authenticated operations dashboard and removes only selected cache entries", async () => {
+    await start(async () => subtitle());
+    const key = "a".repeat(64);
+    await cache.put(subtitle({
+      key,
+      contentId: "tt-dashboard",
+      release: "Dashboard.Movie.2026.mkv",
+      cachedAt: "2026-08-15T00:00:00.000Z",
+    }));
+
+    expect((await fetch(`${base}/wrong/dashboard`)).status).toBe(404);
+    const page = await fetch(`${base}/${TOKEN}/dashboard`);
+    const html = await page.text();
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-security-policy")).toContain("form-action 'self'");
+    expect(html).toContain("AutoSub operations");
+    expect(html).toContain("AI translation usage");
+    expect(html).toContain("Voice analysis usage");
+    expect(html).toContain("Dashboard.Movie.2026.mkv");
+    expect(html).not.toContain("—");
+    const csrf = html.match(/name="csrf" value="([^"]+)"/)?.[1];
+    expect(csrf).toBeTruthy();
+
+    const deleted = await fetch(`${base}/${TOKEN}/admin/cache`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ csrf: csrf as string, confirm: "yes", key }),
+    });
+    expect(deleted.status).toBe(303);
+    expect(await cache.get(key)).toBeUndefined();
   });
 
   it("returns an empty list when no stream has been opened", async () => {

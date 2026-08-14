@@ -1,7 +1,7 @@
 import type { SubtitleCue } from "../domain.js";
 import { HttpError, requestJson } from "../http.js";
 import { collectRows, parseRows, translationPrompt } from "./prompt.js";
-import { batchCues, countCharacters, runBatches, type TranslationUsage, type Translator } from "./types.js";
+import { assertTranslationChanged, batchCues, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
 export interface OpenAiCompatibleSettings {
   baseUrl?: string;
@@ -16,8 +16,8 @@ interface ChatResponse {
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
-const MAX_CUES_PER_BATCH = 80;
-const MAX_CHARACTERS_PER_BATCH = 16_000;
+const MAX_CUES_PER_BATCH = 60;
+const MAX_CHARACTERS_PER_BATCH = 10_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const SCHEMA_ATTEMPTS = 2;
 const SYSTEM_PROMPT = "You are a professional subtitle translator. You reply with JSON only.";
@@ -33,7 +33,7 @@ const SYSTEM_PROMPT = "You are a professional subtitle translator. You reply wit
 export class OpenAiCompatibleTranslator implements Translator {
   readonly name = "openai";
   lastUsage?: TranslationUsage;
-  private usage: TranslationUsage = { characters: 0, promptTokens: 0, responseTokens: 0 };
+  private readonly usages = new WeakMap<SubtitleCue[], TranslationUsage>();
   /**
    * Some endpoints accept only `model` and `messages` and reject everything
    * else outright. Rather than making that a setting, the first rejection
@@ -67,7 +67,7 @@ export class OpenAiCompatibleTranslator implements Translator {
     });
   }
 
-  private async translateBatch(batch: SubtitleCue[], source: string, target: string, signal?: AbortSignal): Promise<Map<number, string>> {
+  private async translateBatch(batch: SubtitleCue[], source: string, target: string, usage: TranslationUsage, signal?: AbortSignal): Promise<Map<number, string>> {
     let lastError: unknown;
     let attempt = 0;
     while (attempt < SCHEMA_ATTEMPTS) {
@@ -84,8 +84,8 @@ export class OpenAiCompatibleTranslator implements Translator {
           body: this.body(batch, source, target),
         });
 
-        this.usage.promptTokens = (this.usage.promptTokens || 0) + (body.usage?.prompt_tokens || 0);
-        this.usage.responseTokens = (this.usage.responseTokens || 0) + (body.usage?.completion_tokens || 0);
+        usage.promptTokens = (usage.promptTokens || 0) + (body.usage?.prompt_tokens || 0);
+        usage.responseTokens = (usage.responseTokens || 0) + (body.usage?.completion_tokens || 0);
         return collectRows(batch, parseRows(body.choices?.[0]?.message?.content || ""));
       } catch (error) {
         lastError = error;
@@ -105,10 +105,20 @@ export class OpenAiCompatibleTranslator implements Translator {
 
   async translate(cues: SubtitleCue[], source: string, target: string, signal?: AbortSignal): Promise<SubtitleCue[]> {
     if (!this.enabled) throw new Error("TRANSLATION_BASE_URL and TRANSLATION_MODEL are required for this translator");
-    this.usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
+    const usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
     const batches = batchCues(cues, MAX_CUES_PER_BATCH, MAX_CHARACTERS_PER_BATCH);
-    const translated = await runBatches(batches, this.settings.concurrency, (batch) => this.translateBatch(batch, source, target, signal));
-    this.lastUsage = { ...this.usage };
-    return cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
+    const translated = await runBatches(batches, this.settings.concurrency, (batch) => runBatchResiliently(
+      batch,
+      (part) => this.translateBatch(part, source, target, usage, signal),
+    ));
+    const result = cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
+    assertTranslationChanged(cues, result);
+    this.lastUsage = { ...usage };
+    this.usages.set(result, { ...usage });
+    return result;
+  }
+
+  usageFor(result: SubtitleCue[]): TranslationUsage | undefined {
+    return this.usages.get(result);
   }
 }

@@ -51,6 +51,22 @@ describe("subtitle cache", () => {
     expect(await cache.get("new")).toBeDefined();
   });
 
+  it("lists operator-safe metadata and removes only valid selected keys", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "autosub-cache-"));
+    const cache = new SubtitleCache(directory);
+    const key = "a".repeat(64);
+    await cache.put({ ...entry(key), contentId: "tt1", release: "Movie.2026.mkv", cachedAt: "2026-08-15T00:00:00.000Z" });
+
+    expect(await cache.list()).toEqual([expect.objectContaining({
+      key,
+      contentId: "tt1",
+      release: "Movie.2026.mkv",
+      bytes: expect.any(Number),
+    })]);
+    expect(await cache.removeMany(["not-a-key", key, key])).toBe(1);
+    expect(await cache.get(key)).toBeUndefined();
+  });
+
   it("derives stable keys from equal inputs only", () => {
     expect(stableKey({ a: 1, b: "x" })).toBe(stableKey({ a: 1, b: "x" }));
     expect(stableKey({ a: 1 })).not.toBe(stableKey({ a: 2 }));

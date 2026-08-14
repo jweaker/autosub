@@ -1,7 +1,7 @@
 import type { ReleaseSignature } from "./domain.js";
 
 const SOURCE_PATTERNS: Array<[ReleaseSignature["source"], RegExp]> = [
-  ["bluray", /\b(?:blu[ ._-]?ray|b[dr]rip|remux)\b/i],
+  ["bluray", /\b(?:blu[ ._-]?ray|b[dr]rip|(?:bd|uhd[ ._-]?bd)?remux|remux)\b/i],
   ["web", /\b(?:web[ ._-]?(?:dl|rip)?|webrip)\b/i],
   ["hdtv", /\bhdtv\b/i],
   ["dvd", /\b(?:dvd(?:rip)?|dvdrip)\b/i],
@@ -47,7 +47,7 @@ export function parseRelease(value?: string): ReleaseSignature | undefined {
 }
 
 export function tokenSimilarity(left: string, right: string): number {
-  const ignored = new Set(["1080p", "2160p", "720p", "x264", "x265", "h264", "h265", "hevc", "aac", "dts"]);
+  const ignored = new Set(["1080p", "2160p", "720p", "x264", "x265", "h264", "h265", "hevc", "hdr", "dv", "uhd", "aac", "dts"]);
   const tokens = (value: string) =>
     new Set(normalizeReleaseName(value).split(" ").filter((token) => token.length > 1 && !ignored.has(token)));
   const a = tokens(left);

@@ -1,5 +1,6 @@
 import type { SubtitleCandidate, SubtitleProvider, SubtitleRequest } from "../domain.js";
 import { requestBytes, requestJson } from "../http.js";
+import { tokenSimilarity } from "../release.js";
 
 const LANGUAGE_NAMES: Record<string, string> = {
   ar: "arabic",
@@ -79,7 +80,11 @@ export class SubSourceProvider implements SubtitleProvider {
       limit: "100",
     });
     if (movieId) params.set("movieId", String(movieId));
-    if (request.filename) params.set("releaseInfo", request.filename);
+    // movieId is already an exact title/season lookup. Combining it with a full
+    // debrid filename makes SubSource treat the release name as another hard
+    // filter, which returned zero results for titles that visibly had dozens of
+    // subtitles. Fetch the title catalogue and rank release evidence locally.
+    else if (request.filename) params.set("releaseInfo", request.filename);
     const body = await requestJson<{ data?: SubSourceSubtitle[] }>(`${API}/subtitles?${params}`, {
       headers: this.headers(),
       signal,
@@ -89,6 +94,8 @@ export class SubSourceProvider implements SubtitleProvider {
 
     return (body.data || []).flatMap((subtitle) => {
       if (!subtitle.subtitleId) return [];
+      const releases = Array.isArray(subtitle.releaseInfo) ? subtitle.releaseInfo : [subtitle.releaseInfo].filter((value): value is string => Boolean(value));
+      const release = releases.sort((left, right) => tokenSimilarity(request.filename || "", right) - tokenSimilarity(request.filename || "", left))[0];
       const rating = typeof subtitle.rating === "number"
         ? subtitle.rating
         : (subtitle.rating?.good || 0) - (subtitle.rating?.bad || 0);
@@ -97,7 +104,7 @@ export class SubSourceProvider implements SubtitleProvider {
         provider: this.name,
         providerId: String(subtitle.subtitleId),
         language,
-        release: Array.isArray(subtitle.releaseInfo) ? subtitle.releaseInfo.join(" ") : subtitle.releaseInfo,
+        release,
         filename: `subsource-${subtitle.subtitleId}.zip`,
         format: "zip",
         fps: Number.isFinite(fps) ? fps : undefined,

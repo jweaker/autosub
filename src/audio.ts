@@ -7,6 +7,7 @@ import { runProcess } from "./process.js";
 interface ProbeStream {
   index: number;
   codec_type?: string;
+  duration?: string;
   tags?: { language?: string; title?: string };
   disposition?: { default?: number };
 }
@@ -15,12 +16,14 @@ interface Transcription {
   language?: string;
   transcript?: string;
   words?: TranscriptWord[];
+  requests?: number;
 }
 
 interface Sample {
   window: VadWindow;
   pcm: Buffer;
   language?: string;
+  deepgramRequests?: number;
 }
 
 const SAMPLE_RATE = 16_000;
@@ -34,6 +37,7 @@ const MINIMUM_TRANSCRIPTS = 3;
 const MINIMUM_SAMPLE_SECONDS = 8;
 const PROBE_SIZE_BYTES = 8 * 1024 * 1024;
 const PROBE_ANALYZE_US = 4_000_000;
+const UNKNOWN_DURATION_FALLBACK_MS = 90 * 60 * 1000;
 // Persistent connections and reconnects: every window is a fresh range request
 // into a remote file, and a dropped one used to cost the whole sample.
 const HTTP_INPUT_ARGS = [
@@ -65,6 +69,25 @@ export function sampleSecondsFor(requested: number, count: number, budgetBytes: 
   if (!bytesPerSecond || bytesPerSecond <= 0) return requested;
   const perWindow = budgetBytes / Math.max(1, count);
   return Math.max(MINIMUM_SAMPLE_SECONDS, Math.min(requested, Math.floor(perWindow / bytesPerSecond)));
+}
+
+/**
+ * Places samples across a release, even when a remote container omits its
+ * duration. The fallback sequence deliberately reaches farther in gradually
+ * larger steps: a one-hour feature still yields three windows, while a long
+ * film gets evidence well beyond its opening act. Out-of-range seeks are
+ * harmless and are replaced by the alternative windows below.
+ */
+export function sampleStartsFor(durationMs: number | undefined, seconds: number, count: number): number[] {
+  if (durationMs && Number.isFinite(durationMs) && durationMs >= 60_000) {
+    const usableStart = Math.min(120_000, durationMs * 0.04);
+    const usableEnd = Math.max(usableStart, (durationMs * 0.92) - (seconds * 1000));
+    return Array.from({ length: count }, (_, index) =>
+      usableStart + ((usableEnd - usableStart) * index / Math.max(1, count - 1)));
+  }
+
+  const fallbackMinutes = [2, 27, 57, 97, 147, 207, 277, 357];
+  return fallbackMinutes.slice(0, Math.max(5, Math.min(count, fallbackMinutes.length))).map((minutes) => minutes * 60_000);
 }
 
 /**
@@ -125,6 +148,9 @@ export function energyVad(pcm: Buffer, sampleRate = SAMPLE_RATE): SpeechInterval
  * the aligner enough evidence to accept or reject a subtitle.
  */
 export class AudioAnalyzer {
+  private vadUnavailable = false;
+  private vadCheck?: Promise<boolean>;
+
   constructor(private readonly config: AppConfig) {}
 
   private async resolveMediaUrl(stream: StreamRecord): Promise<string> {
@@ -154,6 +180,15 @@ export class AudioAnalyzer {
   }
 
   private async vad(pcm: Buffer): Promise<SpeechInterval[]> {
+    this.vadCheck ??= runProcess(this.config.pythonPath, ["-c", "import webrtcvad"], {
+      timeoutMs: 5_000,
+      maxOutputBytes: 64 * 1024,
+    }).then(() => true, (error: unknown) => {
+      this.vadUnavailable = true;
+      console.warn("WebRTC VAD unavailable; using energy VAD:", error instanceof Error ? error.message : error);
+      return false;
+    });
+    if (this.vadUnavailable || !await this.vadCheck) return energyVad(pcm);
     try {
       const result = await runProcess(this.config.pythonPath, [this.config.vadScriptPath, "--sample-rate", String(SAMPLE_RATE)], {
         input: pcm,
@@ -164,12 +199,14 @@ export class AudioAnalyzer {
       if (Array.isArray(parsed.intervals)) return parsed.intervals;
     } catch (error) {
       console.warn("WebRTC VAD unavailable; using energy VAD:", error instanceof Error ? error.message : error);
+      this.vadUnavailable = true;
+      this.vadCheck = Promise.resolve(false);
     }
     return energyVad(pcm);
   }
 
   private async transcribeOnce(pcm: Buffer, languageHint?: string): Promise<Transcription> {
-    if (!this.config.deepgram.apiKey) return {};
+    if (!this.config.deepgram.apiKey) return { requests: 0 };
     const url = new URL("https://api.deepgram.com/v1/listen");
     url.searchParams.set("model", this.config.deepgram.model);
     if (languageHint) url.searchParams.set("language", languageHint);
@@ -202,6 +239,7 @@ export class AudioAnalyzer {
       const channel = body.results?.channels?.[0];
       const alternative = channel?.alternatives?.[0];
       return {
+        requests: 1,
         language: normalizeLanguage(channel?.detected_language) || normalizeLanguage(languageHint),
         transcript: alternative?.transcript?.trim() || undefined,
         words: alternative?.words?.flatMap((word) => {
@@ -217,7 +255,7 @@ export class AudioAnalyzer {
       };
     } catch (error) {
       console.warn("Deepgram transcription failed:", error instanceof Error ? error.message : error);
-      return {};
+      return { requests: 1 };
     }
   }
 
@@ -226,7 +264,11 @@ export class AudioAnalyzer {
     // TMDB/container language tags are usually right, but releases are often
     // mislabeled. Retry using Deepgram detection only when the explicit model
     // produced no speech, so correct non-English tracks do not pay extra time.
-    if (languageHint && !result.transcript) return this.transcribeOnce(pcm);
+    if (languageHint && !result.transcript) {
+      const detected = await this.transcribeOnce(pcm);
+      detected.requests = (result.requests || 0) + (detected.requests || 0);
+      return detected;
+    }
     return result;
   }
 
@@ -237,11 +279,16 @@ export class AudioAnalyzer {
       || streams[0];
   }
 
-  private async probe(mediaUrl: string, headers?: string): Promise<{ durationMs: number; streams: ProbeStream[]; bytesPerSecond?: number }> {
+  private async probe(mediaUrl: string, headers?: string): Promise<{
+    durationMs: number;
+    durationKnown: boolean;
+    streams: ProbeStream[];
+    bytesPerSecond?: number;
+  }> {
     const args = ["-v", "error", ...HTTP_INPUT_ARGS, "-probesize", String(PROBE_SIZE_BYTES), "-analyzeduration", String(PROBE_ANALYZE_US)];
     if (headers) args.push("-headers", headers);
     args.push(
-      "-show_entries", "format=duration,size,bit_rate:stream=index,codec_type:stream_tags=language,title:stream_disposition=default",
+      "-show_entries", "format=duration,size,bit_rate:stream=index,codec_type,duration:stream_tags=language,title:stream_disposition=default",
       "-of", "json", mediaUrl,
     );
     const result = await runProcess(this.config.ffprobePath, args, { timeoutMs: PROBE_TIMEOUT_MS, maxOutputBytes: 2 * 1024 * 1024 });
@@ -249,8 +296,12 @@ export class AudioAnalyzer {
       format?: { duration?: string; size?: string; bit_rate?: string };
       streams?: ProbeStream[];
     };
-    const durationMs = Math.round(Number(data.format?.duration) * 1000);
-    if (!Number.isFinite(durationMs) || durationMs < 60_000) throw new Error("Could not determine media duration");
+    const durationSeconds = [Number(data.format?.duration), ...(data.streams || []).map((stream) => Number(stream.duration))]
+      .filter((value) => Number.isFinite(value) && value >= 60)
+      .reduce((longest, value) => Math.max(longest, value), 0);
+    const durationKnown = durationSeconds >= 60;
+    const durationMs = durationKnown ? Math.round(durationSeconds * 1000) : UNKNOWN_DURATION_FALLBACK_MS;
+    if (!durationKnown) console.warn("Media duration unavailable; using duration-independent audio sampling");
 
     // Sampling reads the interleaved container, not just the audio track, so
     // the release's overall bitrate is what a sample actually costs.
@@ -259,7 +310,7 @@ export class AudioAnalyzer {
     const bytesPerSecond = Number.isFinite(bitrate) && bitrate > 0
       ? bitrate / 8
       : (Number.isFinite(size) && size > 0 ? size / (durationMs / 1000) : undefined);
-    return { durationMs, streams: data.streams || [], bytesPerSecond };
+    return { durationMs, durationKnown, streams: data.streams || [], bytesPerSecond };
   }
 
 
@@ -315,6 +366,7 @@ export class AudioAnalyzer {
       item.window.transcript = transcription.transcript;
       item.window.words = transcription.words;
       item.language = transcription.language;
+      item.deepgramRequests = transcription.requests;
       return item;
     };
   }
@@ -335,7 +387,7 @@ export class AudioAnalyzer {
     const mediaUrl = await this.resolveMediaUrl(stream);
     const resolvedAt = Date.now();
     const headers = safeHeaders(stream.requestHeaders);
-    const { durationMs, streams, bytesPerSecond } = await this.probe(mediaUrl, headers);
+    const { durationMs, durationKnown, streams, bytesPerSecond } = await this.probe(mediaUrl, headers);
     const probedAt = Date.now();
 
     const audioStreams = streams.filter((item) => item.codec_type === "audio");
@@ -346,11 +398,9 @@ export class AudioAnalyzer {
 
     const count = Math.max(MINIMUM_WINDOWS + 1, this.config.audioSampleCount);
     const seconds = sampleSecondsFor(this.config.audioSampleSeconds, count, this.config.audioBudgetBytes, bytesPerSecond);
-    // Skip credits at both ends: the opening logos and the closing crawl carry
-    // little dialogue and often differ between releases.
-    const usableStart = Math.min(120_000, durationMs * 0.04);
-    const usableEnd = Math.max(usableStart, (durationMs * 0.92) - (seconds * 1000));
-    const starts = Array.from({ length: count }, (_, index) => usableStart + ((usableEnd - usableStart) * index / Math.max(1, count - 1)));
+    // Skip credits at both ends when duration is known. Remote MP4s sometimes
+    // omit it entirely; fixed, widening seeks keep those releases usable.
+    const starts = sampleStartsFor(durationKnown ? durationMs : undefined, seconds, count);
 
     const analyse = this.analyser(mediaUrl, headers, selected.index, seconds, preferred || audioLanguage);
     const samples = await this.collect(starts, analyse);
@@ -358,8 +408,13 @@ export class AudioAnalyzer {
     // Quiet windows are common (action scenes, music). Replace a few rather
     // than failing the whole title.
     if (samples.filter((item) => item.window.transcript).length < MINIMUM_TRANSCRIPTS) {
-      const alternatives = [0.18, 0.48, 0.76]
-        .map((fraction) => usableStart + ((usableEnd - usableStart) * fraction))
+      const alternatives = (durationKnown
+        ? [0.18, 0.48, 0.76].map((fraction) => {
+          const usableStart = starts[0];
+          const usableEnd = starts.at(-1) || usableStart;
+          return usableStart + ((usableEnd - usableStart) * fraction);
+        })
+        : [12, 42, 72].map((minutes) => minutes * 60_000))
         .filter((startMs) => starts.every((existing) => Math.abs(existing - startMs) > seconds * 2_000))
         .slice(0, 2);
       samples.push(...await this.collect(alternatives, analyse));
@@ -371,6 +426,9 @@ export class AudioAnalyzer {
     const windows = samples.map((item) => item.window).sort((left, right) => left.startMs - right.startMs);
     if (windows.length < MINIMUM_WINDOWS) throw new Error("Not enough audio samples could be read from the selected stream");
     const transcripts = windows.filter((window) => window.transcript).length;
+    const deepgramRequests = samples.reduce((total, item) => total + (item.deepgramRequests || 0), 0);
+    const deepgramSeconds = Number(samples.reduce((total, item) =>
+      total + ((item.window.durationMs / 1000) * (item.deepgramRequests || 0)), 0).toFixed(2));
     const megabitsPerSecond = bytesPerSecond ? Number(((bytesPerSecond * 8) / 1e6).toFixed(1)) : undefined;
     console.log([
       `Audio analysis: ${windows.length} windows (${starts.length} primary) of ${seconds}s`,
@@ -388,6 +446,8 @@ export class AudioAnalyzer {
       windows,
       sampleSeconds: seconds,
       megabitsPerSecond,
+      deepgramRequests,
+      deepgramSeconds,
       timings: {
         resolveMs: resolvedAt - started,
         probeMs: probedAt - resolvedAt,

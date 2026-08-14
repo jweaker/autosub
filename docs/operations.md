@@ -9,14 +9,28 @@
 | `GET /:token/configure` | Install page with the deep link and manifest URL |
 | `GET /:token/manifest.json` | Stremio addon manifest |
 | `GET /:token/stats` | What recent preparations cost, stage by stage |
+| `GET /:token/dashboard` | Human-readable operations, usage, failures, and cache controls |
+| `POST /:token/admin/cache` | Deletes only cache entries selected and confirmed on the dashboard |
 | `GET /:token/stream/:type/:id.json` | Upstream streams, rewritten as play links |
 | `GET /:token/play/:playId` | Records the release, starts preparation, 302s to the debrid URL |
 | `GET /:token/subtitles/:type/:id[/:extra].json` | Subtitle list for the release being played |
 | `GET /:token/file/:jobId.srt` | The finished subtitle |
 | `GET /:token/next/:jobId[/:attempt].srt` | Rejects the current subtitle and serves the next candidate |
-| `GET /:token/translate/:jobId.srt` | Translates the trusted timing track on request |
+| `GET /:token/translate/:jobId.srt` | Forces AI translation of the trusted timing track on request |
 
 Anything with a wrong token returns 404, compared in constant time.
+
+## Operations dashboard
+
+Open this private URL in a browser:
+
+```text
+$PUBLIC_URL/$INSTALL_TOKEN/dashboard
+```
+
+It summarizes recent success and failure rates, stage latency, AI prompt and response tokens, source characters, Deepgram requests and submitted audio, probe reuse, active jobs, failure reasons, and cache size. The latest runs remain available as JSON at `/:token/stats` for automation.
+
+Cache deletion is deliberately selective. Filter by title, release, or provider, select entries, acknowledge that they will be regenerated, and submit. The form carries a process-local anti-forgery token and accepts only validated cache keys; it cannot delete the registry, rejection history, configuration, or arbitrary files.
 
 ## Health
 
@@ -58,7 +72,7 @@ curl -fsS "$PUBLIC_URL/$INSTALL_TOKEN/stats" | jq '.runs[0]'
 }
 ```
 
-Every delivered run carries `speechErrorMs`: how far the finished subtitle sits from the speech in the sampled audio, measured after every other decision was made. A well-timed track is within a couple of hundred milliseconds; anything past 1200 ms is refused outright, whichever route produced it. Translated runs also carry a `translation` block with the cue count and the tokens the model actually charged for, which is the only honest way to know what a title cost. `audio` almost always dominates a cold run, and it is bandwidth, not CPU: sampling reads the interleaved container, so the cost scales with the release's bitrate. `AUDIO_BUDGET_MB` caps it. `outcome` is `cached`, `direct`, `translated` or `failed`.
+Every delivered run carries `speechErrorMs`: how far the finished subtitle sits from the speech in the sampled audio, measured after every other decision was made. A well-timed track is within a couple of hundred milliseconds; anything past 1200 ms is refused outright, whichever route produced it. Failed runs retain `failure`, `excluded`, and an `evaluations` object with discovered/attempted/decoded/passed counts, the best confidence seen, and cue-cleanup totals. This distinguishes "no provider result" from "ten real files were decoded but none reached 58" without reconstructing expired logs. Translated runs also carry a `translation` block with cue and token counts. New cold runs carry an `audio` block with sampled seconds, transcripts, exact Deepgram requests and submitted seconds, and whether the audio probe was reused. `outcome` is `cached`, `direct`, `translated` or `failed`.
 
 ## Status codes
 
@@ -113,7 +127,7 @@ data/subtitles/        cached results
 
 All three are safe to delete while the service is stopped: the registry rebuilds as titles are browsed, and the cache re-derives on the next play. Expired registry records and cached subtitles older than `CACHE_TTL_DAYS` are swept hourly and at startup.
 
-To force a re-run for one title, delete its `data/subtitles/<key>.*` pair — or simply bump `GEMINI_MODEL`, which invalidates translated entries by design. Deleting `data/rejections.json` gives every previously rejected subtitle another chance.
+To force a re-run for one title, use the dashboard's selective cache controls. Deleting `data/rejections.json` gives every previously rejected subtitle another chance, but this is intentionally not exposed as a dashboard action.
 
 ## Restarting and updating
 

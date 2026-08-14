@@ -43,9 +43,13 @@ export class RejectionStore {
   }
 
   async add(releaseKey: string, variantId: string): Promise<string[]> {
+    return this.addMany(releaseKey, [variantId]);
+  }
+
+  async addMany(releaseKey: string, variantIds: string[]): Promise<string[]> {
     await this.load();
     const existing = this.rejected.get(releaseKey) || [];
-    if (!existing.includes(variantId)) existing.push(variantId);
+    for (const variantId of variantIds) if (!existing.includes(variantId)) existing.push(variantId);
     // Re-inserting moves this release to the end of the map, so eviction below
     // drops the least recently touched titles first.
     this.rejected.delete(releaseKey);

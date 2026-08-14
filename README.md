@@ -62,7 +62,7 @@ Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` 
 6. **Validation.** Candidates are downloaded in waves — the best entry from each provider at a time — and scored against the speech timeline. A global model corrects constant delay and constrained frame-rate drift (50 ms / 0.01% precision). Anything that only fits in places is rejected.
 7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. A source track that no candidate can align to is discarded and the next best one tried, because a subtitle cut for a different edit can match the audio and still be a useless reference.
 8. **When the spoken language has nothing.** Some films — anime especially — have a handful of subtitles in their original language and hundreds in English. Speech activity is language-independent, so an English subtitle can be validated against the audio and then vouch for the Arabic one across the whole title. Failing even that, the Arabic track is checked against speech activity directly. Both answer to a higher confidence bar than a transcript match.
-9. **Translation, only if asked.** When no candidate matches any trusted track, AutoSub says so and offers a translation from the subtitle menu. The chosen engine then translates the corrected source text; timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. Set `TRANSLATION_MODE=auto` to have it happen unprompted, or `off` to disable it. See [docs/translation.md](docs/translation.md) for choosing an engine.
+9. **Translation, only if asked.** The `force AI translation` menu row is a real override: it validates a source-language timing track and translates it even when a working Arabic subtitle already exists. Direct and forced results have separate cache entries, so choosing AI never replaces the normal row. When no direct candidate matches, AutoSub points the viewer to the same row; set `TRANSLATION_MODE=auto` to translate that fallback unprompted, or `off` to disable it. Timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. See [docs/translation.md](docs/translation.md) for choosing an engine.
 10. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
 
 If nothing passes, AutoSub says so rather than serving a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
@@ -142,6 +142,7 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
 | `TRANSLATION_MODE` | `manual` | `manual` offers translation in the menu, `auto` runs it unprompted, `off` disables it |
 | `TRANSLATION_PROVIDER` | `gemini` | `gemini`, `openai` (any chat-completions endpoint), `deepl`, or `libretranslate` |
+| `TRANSLATION_CONCURRENCY` | `4` | Independent AI translation batches processed at once (1–12) |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
 
@@ -156,6 +157,8 @@ docker compose build --pull && docker compose up -d   # update
 npm run smoke -- tt1234567                   # end-to-end check against a real title
 curl -fsS $PUBLIC_URL/$INSTALL_TOKEN/stats   # what recent runs cost, stage by stage
 ```
+
+Open `$PUBLIC_URL/$INSTALL_TOKEN/dashboard` for the human-readable operations page: success and failure rates, AI token usage, Deepgram audio usage, recent runs, and selective cache deletion. Treat the URL as a credential.
 
 Each finished subtitle carries `X-AutoSub-Confidence`, `X-AutoSub-Provider`, `X-AutoSub-Translated` and `X-AutoSub-Variant` headers, and the logs record the chosen provider, language, confidence, offset and rate for every run. [docs/operations.md](docs/operations.md) covers failure modes, status codes and troubleshooting.
 

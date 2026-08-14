@@ -29,6 +29,7 @@ describe("status labels", () => {
   it("names the language first so the row reads like the list it sits in", () => {
     expect(retryLabel("ar")).toBe("Arabic - try another (AutoSub)");
     expect(failedLabel()).toBe("AutoSub: nothing matched this release");
+    expect(failedLabel(true)).toBe("AutoSub: no direct match - AI translation available");
   });
 
   it("numbers further attempts so they read as successive tries", () => {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import type { SubtitleCue } from "../src/domain.js";
 import { createTranslator, DeepLTranslator, LibreTranslateTranslator, OpenAiCompatibleTranslator } from "../src/translation/index.js";
+import { assertTranslationChanged, batchCues, runBatchResiliently, runBatches } from "../src/translation/types.js";
 
 const cues: SubtitleCue[] = Array.from({ length: 5 }, (_, index) => ({
   id: index + 1,
@@ -104,6 +105,28 @@ describe("OpenAI-compatible backend", () => {
     await new OpenAiCompatibleTranslator({ ...settings, baseUrl: "https://gateway.test/v1/chat/completions" }).translate(cues, "en", "ar");
     expect(fetchMock).toHaveBeenCalledOnce();
   });
+
+  it("keeps usage attached to the right result when titles translate concurrently", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { messages: Array<{ content: string }> };
+      const sent = JSON.parse(body.messages.at(-1)?.content.split("Cues: ")[1].split("\nRespond")[0] || "[]") as Array<{ id: number; text: string }>;
+      const first = sent[0]?.text.startsWith("first");
+      await new Promise((resolve) => setTimeout(resolve, first ? 15 : 1));
+      return jsonResponse({
+        choices: [{ message: { content: JSON.stringify(sent.map((cue) => ({ id: cue.id, text: `مترجم ${cue.id}` }))) } }],
+        usage: { prompt_tokens: first ? 101 : 202, completion_tokens: first ? 11 : 22 },
+      });
+    }));
+    const translator = new OpenAiCompatibleTranslator(settings);
+    const first = cues.map((cue) => ({ ...cue, text: `first dialogue ${cue.id}` }));
+    const second = cues.map((cue) => ({ ...cue, text: `second dialogue ${cue.id}` }));
+    const [firstResult, secondResult] = await Promise.all([
+      translator.translate(first, "en", "ar"),
+      translator.translate(second, "en", "ar"),
+    ]);
+    expect(translator.usageFor(firstResult)?.promptTokens).toBe(101);
+    expect(translator.usageFor(secondResult)?.promptTokens).toBe(202);
+  });
 });
 
 describe("machine translation backends", () => {
@@ -155,5 +178,52 @@ describe("machine translation backends", () => {
     const translator = new LibreTranslateTranslator({ baseUrl: "http://vps.test:5000", concurrency: 1 });
     await translator.translate(cues, "en", "ar");
     expect(translator.lastUsage?.characters).toBe(cues.reduce((total, cue) => total + cue.text.length, 0));
+  });
+});
+
+describe("translation batching", () => {
+  it("cuts near a scene pause instead of in the middle of an exchange", () => {
+    const dialogue = Array.from({ length: 8 }, (_, index) => ({
+      ...cues[0],
+      id: index + 1,
+      startMs: index < 4 ? index * 1_000 : 10_000 + (index * 1_000),
+      endMs: index < 4 ? index * 1_000 + 800 : 10_800 + (index * 1_000),
+      text: `line ${index}`,
+    }));
+    const batches = batchCues(dialogue, 6, 10_000);
+    expect(batches.map((batch) => batch.map((cue) => cue.id))).toEqual([[1, 2, 3, 4], [5, 6, 7, 8]]);
+  });
+
+  it("runs independent batches at the configured concurrency", async () => {
+    const many = Array.from({ length: 12 }, (_, index) => ({ ...cues[0], id: index + 1, text: `line ${index}` }));
+    const batches = Array.from({ length: 6 }, (_, index) => many.slice(index * 2, index * 2 + 2));
+    let active = 0;
+    let maximum = 0;
+    const translated = await runBatches(batches, 4, async (batch) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      return new Map(batch.map((cue) => [cue.id, `ar ${cue.id}`]));
+    });
+    expect(maximum).toBe(4);
+    expect(translated.size).toBe(12);
+  });
+
+  it("splits only a malformed large batch instead of failing the title", async () => {
+    const many = Array.from({ length: 24 }, (_, index) => ({ ...cues[0], id: index + 1 }));
+    const sizes: number[] = [];
+    const result = await runBatchResiliently(many, async (batch) => {
+      sizes.push(batch.length);
+      if (batch.length > 12) throw new Error("truncated JSON");
+      return new Map(batch.map((cue) => [cue.id, `ok ${cue.id}`]));
+    });
+    expect(sizes).toEqual([24, 12, 12]);
+    expect(result.size).toBe(24);
+  });
+
+  it("refuses a model that mostly echoed the source dialogue", () => {
+    const source = Array.from({ length: 20 }, (_, index) => ({ ...cues[0], id: index + 1, text: `original dialogue line ${index}` }));
+    expect(() => assertTranslationChanged(source, source)).toThrow(/left 20\/20/);
   });
 });

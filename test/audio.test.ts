@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { energyVad, sampleSecondsFor } from "../src/audio.js";
+import { energyVad, sampleSecondsFor, sampleStartsFor } from "../src/audio.js";
 
 const SAMPLE_RATE = 16_000;
 
@@ -68,5 +68,24 @@ describe("sample length", () => {
 
   it("never lengthens beyond what was asked for", () => {
     expect(sampleSecondsFor(10, 4, budget, mbps(1))).toBe(10);
+  });
+});
+
+describe("sample placement", () => {
+  it("spreads known-duration samples between the opening and credits", () => {
+    const starts = sampleStartsFor(2 * 60 * 60 * 1000, 15, 4);
+    expect(starts).toHaveLength(4);
+    expect(starts[0]).toBeGreaterThan(0);
+    expect(starts.at(-1)).toBeLessThan(2 * 60 * 60 * 1000);
+  });
+
+  it("keeps duration-less movies analyzable across short and long runtimes", () => {
+    expect(sampleStartsFor(undefined, 15, 4)).toEqual([
+      2 * 60_000,
+      27 * 60_000,
+      57 * 60_000,
+      97 * 60_000,
+      147 * 60_000,
+    ]);
   });
 });

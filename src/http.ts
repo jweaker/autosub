@@ -1,6 +1,8 @@
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 const DEFAULT_TIMEOUT_MS = 10_000;
-const MAX_RETRY_DELAY_MS = 4_000;
+// Short rate-limit windows are worth respecting; daily/hourly quota exhaustion
+// is surfaced immediately and handled by the pipeline's provider cooldown.
+const MAX_RETRY_DELAY_MS = 30_000;
 
 export interface RequestOptions extends Omit<RequestInit, "signal"> {
   /** Per-attempt deadline. Each retry gets a fresh one. */
@@ -14,7 +16,7 @@ export interface RequestOptions extends Omit<RequestInit, "signal"> {
 }
 
 export class HttpError extends Error {
-  constructor(readonly status: number, label: string, detail?: string) {
+  constructor(readonly status: number, label: string, detail?: string, readonly retryAfterMs?: number) {
     super(`${label} failed: ${status}${detail ? ` ${detail}` : ""}`);
     this.name = "HttpError";
   }
@@ -22,6 +24,15 @@ export class HttpError extends Error {
   get retryable(): boolean {
     return RETRYABLE_STATUS.has(this.status);
   }
+}
+
+function retryAfterMs(response: Response): number | undefined {
+  const header = response.headers.get("retry-after");
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(header);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
 }
 
 const delay = (ms: number, signal?: AbortSignal): Promise<void> =>
@@ -46,13 +57,8 @@ export function isTransient(error: unknown): boolean {
 
 /** Honours Retry-After when the server sends it, otherwise exponential backoff with jitter. */
 function backoffMs(attempt: number, response?: Response): number {
-  const header = response?.headers.get("retry-after");
-  if (header) {
-    const seconds = Number(header);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(MAX_RETRY_DELAY_MS, seconds * 1_000);
-    const date = Date.parse(header);
-    if (Number.isFinite(date)) return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, date - Date.now()));
-  }
+  const requested = response ? retryAfterMs(response) : undefined;
+  if (requested !== undefined) return Math.min(MAX_RETRY_DELAY_MS, requested);
   const base = Math.min(MAX_RETRY_DELAY_MS, 250 * 2 ** (attempt - 1));
   return base + Math.floor(Math.random() * 250);
 }
@@ -75,12 +81,18 @@ export async function request(url: string | URL, options: RequestOptions = {}): 
       const response = await fetch(url, { ...init, signal: combined });
       if (response.ok) return response;
       const detail = (await response.text().catch(() => "")).slice(0, 200);
-      const error = new HttpError(response.status, name, detail);
+      const requestedDelay = retryAfterMs(response);
+      const error = new HttpError(response.status, name, detail, requestedDelay);
       if (attempt >= attempts || !error.retryable) throw error;
+      // A provider saying "come back in four hours" is an exhausted quota, not
+      // a transient worth repeating four seconds later. Retrying only burns a
+      // second request and delays every remaining candidate from that provider.
+      if (requestedDelay !== undefined && requestedDelay > MAX_RETRY_DELAY_MS) throw error;
       lastError = error;
       await delay(backoffMs(attempt, response), signal);
     } catch (error) {
       if (error instanceof HttpError && !error.retryable) throw error;
+      if (error instanceof HttpError && (error.retryAfterMs || 0) > MAX_RETRY_DELAY_MS) throw error;
       // The caller's own cancellation is final; only our per-attempt timeout retries.
       if (signal?.aborted) throw error;
       if (attempt >= attempts || !isTransient(error)) throw error;

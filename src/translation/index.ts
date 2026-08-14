@@ -31,6 +31,7 @@ export function createTranslator(config: AppConfig): Translator {
         apiKey: translation.apiKey || config.gemini.apiKey,
         model: translation.model || config.gemini.model,
         concurrency: translation.concurrency,
+        timeoutMs: translation.timeoutMs,
       });
   }
 }

@@ -69,6 +69,15 @@ describe("subtitle preparation", () => {
     expect(prepareSubtitle(archive, candidate())).toContain("full");
   });
 
+  it("picks the candidate language from a multi-language archive", () => {
+    const archive = zipSync({
+      "Movie.English.eng.srt": bytes(`${srt("English")}${srt("larger English track")}`),
+      "Movie.Arabic.ara.srt": bytes(srt("العربية الصحيحة")),
+    });
+    expect(prepareSubtitle(archive, candidate())).toContain("العربية الصحيحة");
+    expect(prepareSubtitle(archive, candidate())).not.toContain("larger English track");
+  });
+
   it("rejects a download that is not a timed subtitle", () => {
     expect(() => prepareSubtitle(bytes("<html>not found</html>"), candidate())).toThrow(/not a valid timed subtitle/);
   });
