@@ -128,6 +128,24 @@ describe("OpenAI-compatible backend", () => {
     expect(translator.usageFor(firstResult)?.promptTokens).toBe(101);
     expect(translator.usageFor(secondResult)?.promptTokens).toBe(202);
   });
+
+  it("uses larger film batches to reduce fixed gateway token overhead", async () => {
+    const many = Array.from({ length: 121 }, (_, index) => ({
+      ...cues[0],
+      id: index + 1,
+      text: `source dialogue line ${index + 1}`,
+    }));
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { messages: Array<{ content: string }> };
+      const sent = JSON.parse(body.messages.at(-1)?.content.split("Cues: ")[1].split("\nRespond")[0] || "[]") as Array<{ id: number }>;
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify(sent.map((cue) => ({ id: cue.id, text: `مترجم ${cue.id}` }))) } }] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await new OpenAiCompatibleTranslator(settings).translate(many, "en", "ar");
+    expect(result).toHaveLength(121);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("machine translation backends", () => {

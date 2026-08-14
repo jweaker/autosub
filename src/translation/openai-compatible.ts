@@ -16,8 +16,11 @@ interface ChatResponse {
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
-const MAX_CUES_PER_BATCH = 60;
-const MAX_CHARACTERS_PER_BATCH = 10_000;
+// The gateway adds meaningful fixed context to every request. Film-sized
+// batches halve both that token overhead and wall time compared with the old
+// 60-cue limit, while resilient splitting still recovers a malformed answer.
+const MAX_CUES_PER_BATCH = 120;
+const MAX_CHARACTERS_PER_BATCH = 18_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const SCHEMA_ATTEMPTS = 2;
 const SYSTEM_PROMPT = "You are a professional subtitle translator. You reply with JSON only.";
@@ -26,9 +29,9 @@ const SYSTEM_PROMPT = "You are a professional subtitle translator. You reply wit
  * Anything speaking the OpenAI chat-completions shape: a self-hosted model, a
  * router with a free tier, a local Ollama, a paid endpoint.
  *
- * Batches are smaller than Gemini's because smaller and free-tier models tend
- * to drop cues from long lists, and a short batch of a hundred lines is the
- * difference between a retry and a failed title.
+ * Batches stay bounded because smaller and free-tier models can drop cues from
+ * long lists. The parser verifies every cue and recursively retries smaller
+ * halves, so capable models get fewer, faster calls without weakening safety.
  */
 export class OpenAiCompatibleTranslator implements Translator {
   readonly name = "openai";
