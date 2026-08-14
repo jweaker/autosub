@@ -1,5 +1,5 @@
 import type { SubtitleCue } from "../domain.js";
-import { requestJson } from "../http.js";
+import { isTransient, requestJson } from "../http.js";
 import { collectRows, parseRows, translationPrompt } from "./prompt.js";
 import { assertTranslationChanged, batchCues, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
@@ -28,8 +28,11 @@ export class GeminiTranslator implements Translator {
   readonly name = "gemini";
   lastUsage?: TranslationUsage;
   private readonly usages = new WeakMap<SubtitleCue[], TranslationUsage>();
+  private effectiveConcurrency: number;
 
-  constructor(private readonly settings: GeminiSettings) {}
+  constructor(private readonly settings: GeminiSettings) {
+    this.effectiveConcurrency = settings.concurrency;
+  }
 
   get enabled(): boolean {
     return Boolean(this.settings.apiKey);
@@ -75,7 +78,9 @@ export class GeminiTranslator implements Translator {
         return collectRows(batch, parseRows(text));
       } catch (error) {
         lastError = error;
-        if (attempt >= SCHEMA_ATTEMPTS || signal?.aborted) break;
+        if (signal?.aborted) throw new Error("Translation aborted");
+        if (isTransient(error)) throw error;
+        if (attempt >= SCHEMA_ATTEMPTS) break;
       }
     }
     throw lastError instanceof Error ? lastError : new Error("Gemini translation failed");
@@ -85,10 +90,14 @@ export class GeminiTranslator implements Translator {
     if (!this.enabled) throw new Error("No Gemini API key is configured for subtitle translation");
     const usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
     const batches = batchCues(cues, MAX_CUES_PER_BATCH, MAX_CHARACTERS_PER_BATCH);
-    const translated = await runBatches(batches, this.settings.concurrency, (batch) => runBatchResiliently(
+    const translated = await runBatches(batches, this.effectiveConcurrency, (batch) => runBatchResiliently(
       batch,
       (part) => this.translateBatch(part, source, target, usage, signal),
-    ));
+    ), {
+      onConcurrencyReduced: (concurrency) => {
+        this.effectiveConcurrency = Math.min(this.effectiveConcurrency, concurrency);
+      },
+    });
     const result = cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
     assertTranslationChanged(cues, result);
     this.lastUsage = { ...usage };

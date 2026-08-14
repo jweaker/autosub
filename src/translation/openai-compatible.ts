@@ -1,5 +1,5 @@
 import type { SubtitleCue } from "../domain.js";
-import { HttpError, requestJson } from "../http.js";
+import { HttpError, isTransient, requestJson } from "../http.js";
 import { collectRows, parseRows, translationPrompt } from "./prompt.js";
 import { assertTranslationChanged, batchCues, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
@@ -40,8 +40,11 @@ export class OpenAiCompatibleTranslator implements Translator {
    * teaches this instance to send the bare request from then on.
    */
   private minimalPayload = false;
+  private effectiveConcurrency: number;
 
-  constructor(private readonly settings: OpenAiCompatibleSettings) {}
+  constructor(private readonly settings: OpenAiCompatibleSettings) {
+    this.effectiveConcurrency = settings.concurrency;
+  }
 
   get enabled(): boolean {
     return Boolean(this.settings.baseUrl && this.settings.model);
@@ -89,6 +92,7 @@ export class OpenAiCompatibleTranslator implements Translator {
         return collectRows(batch, parseRows(body.choices?.[0]?.message?.content || ""));
       } catch (error) {
         lastError = error;
+        if (signal?.aborted) throw new Error("Translation aborted");
         // A rejected request shape is worth one free retry: it means the
         // endpoint is stricter than the defaults, not that translation failed.
         if (!this.minimalPayload && error instanceof HttpError && (error.status === 400 || error.status === 422)) {
@@ -96,8 +100,11 @@ export class OpenAiCompatibleTranslator implements Translator {
           this.minimalPayload = true;
           continue;
         }
+        // requestJson already retried transport faults. A schema retry here
+        // would make every parallel worker hammer the same saturated gateway.
+        if (isTransient(error)) throw error;
         attempt += 1;
-        if (attempt >= SCHEMA_ATTEMPTS || signal?.aborted) break;
+        if (attempt >= SCHEMA_ATTEMPTS) break;
       }
     }
     throw lastError instanceof Error ? lastError : new Error("Translation failed");
@@ -107,10 +114,14 @@ export class OpenAiCompatibleTranslator implements Translator {
     if (!this.enabled) throw new Error("TRANSLATION_BASE_URL and TRANSLATION_MODEL are required for this translator");
     const usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
     const batches = batchCues(cues, MAX_CUES_PER_BATCH, MAX_CHARACTERS_PER_BATCH);
-    const translated = await runBatches(batches, this.settings.concurrency, (batch) => runBatchResiliently(
+    const translated = await runBatches(batches, this.effectiveConcurrency, (batch) => runBatchResiliently(
       batch,
       (part) => this.translateBatch(part, source, target, usage, signal),
-    ));
+    ), {
+      onConcurrencyReduced: (concurrency) => {
+        this.effectiveConcurrency = Math.min(this.effectiveConcurrency, concurrency);
+      },
+    });
     const result = cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
     assertTranslationChanged(cues, result);
     this.lastUsage = { ...usage };

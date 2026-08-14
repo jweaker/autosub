@@ -47,7 +47,7 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.16.0",
+  version: "1.16.1",
   name: "AutoSub",
   description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback and override",
   resources: [

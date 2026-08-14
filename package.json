@@ -1,6 +1,6 @@
 {
   "name": "autosub",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "private": true,
   "description": "Audio-validated, automatically synchronized subtitles for Stremio, Arabic-first with AI translation fallback and override",
   "license": "MIT",

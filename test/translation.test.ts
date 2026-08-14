@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import type { SubtitleCue } from "../src/domain.js";
+import { HttpError } from "../src/http.js";
 import { createTranslator, DeepLTranslator, LibreTranslateTranslator, OpenAiCompatibleTranslator } from "../src/translation/index.js";
 import { assertTranslationChanged, batchCues, runBatchResiliently, runBatches } from "../src/translation/types.js";
 
@@ -210,6 +211,27 @@ describe("translation batching", () => {
     expect(translated.size).toBe(12);
   });
 
+  it("preserves completed batches and reduces concurrency after endpoint backpressure", async () => {
+    const many = Array.from({ length: 8 }, (_, index) => ({ ...cues[0], id: index + 1, text: `line ${index}` }));
+    const batches = many.map((cue) => [cue]);
+    const reductions: number[] = [];
+    let active = 0;
+    let maximum = 0;
+    const translated = await runBatches(batches, 4, async (batch) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      const accepted = active === 1;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      if (!accepted) throw new HttpError(429, "test translation", "concurrency limit");
+      return new Map([[batch[0].id, `ar ${batch[0].id}`]]);
+    }, { retryDelayMs: 1, onConcurrencyReduced: (value) => reductions.push(value) });
+
+    expect(maximum).toBe(4);
+    expect(reductions).toEqual([2, 1]);
+    expect(translated.size).toBe(8);
+  });
+
   it("splits only a malformed large batch instead of failing the title", async () => {
     const many = Array.from({ length: 24 }, (_, index) => ({ ...cues[0], id: index + 1 }));
     const sizes: number[] = [];
@@ -220,6 +242,15 @@ describe("translation batching", () => {
     });
     expect(sizes).toEqual([24, 12, 12]);
     expect(result.size).toBe(24);
+  });
+
+  it("does not split a rate-limited batch into more requests", async () => {
+    const many = Array.from({ length: 24 }, (_, index) => ({ ...cues[0], id: index + 1 }));
+    const work = vi.fn(async () => {
+      throw new HttpError(429, "test translation", "concurrency limit");
+    });
+    await expect(runBatchResiliently(many, work)).rejects.toThrow(/429/);
+    expect(work).toHaveBeenCalledOnce();
   });
 
   it("refuses a model that mostly echoed the source dialogue", () => {

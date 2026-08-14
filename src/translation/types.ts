@@ -1,4 +1,5 @@
 import type { SubtitleCue } from "../domain.js";
+import { HttpError, isTransient } from "../http.js";
 
 export interface TranslationUsage {
   /** Characters submitted, which is what character-billed engines charge for. */
@@ -50,21 +51,83 @@ export function batchCues(cues: SubtitleCue[], maxCues: number, maxCharacters: n
   return batches;
 }
 
-/** Runs batches with a small amount of concurrency, preserving cue identity. */
+export interface BatchRunOptions {
+  /** Number of scheduler-level attempts for a batch after transport retries. */
+  attempts?: number;
+  /** Initial pause after endpoint backpressure. Primarily shortened in tests. */
+  retryDelayMs?: number;
+  /** Lets a long-lived translator remember the endpoint's working limit. */
+  onConcurrencyReduced?: (concurrency: number) => void;
+}
+
+interface PendingBatch {
+  batch: SubtitleCue[];
+  attempts: number;
+}
+
+const wait = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+/**
+ * Runs independent batches concurrently while adapting to endpoint pressure.
+ *
+ * A gateway with a concurrency limit commonly accepts one request and rejects
+ * the other workers with 429. Waiting for the accepted work, preserving it,
+ * then halving only the remaining parallelism makes the title finish without
+ * restarting paid batches or making every future title sequential.
+ */
 export async function runBatches(
   batches: SubtitleCue[][],
   concurrency: number,
   work: (batch: SubtitleCue[]) => Promise<Map<number, string>>,
+  options: BatchRunOptions = {},
 ): Promise<Map<number, string>> {
   const translated = new Map<number, string>();
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < batches.length) {
-      const batch = batches[next++];
-      for (const [id, text] of await work(batch)) translated.set(id, text);
+  const maximumAttempts = Math.max(1, options.attempts ?? 5);
+  const retryDelayMs = Math.max(0, options.retryDelayMs ?? 1_000);
+  let limit = Math.max(1, Math.min(concurrency, batches.length));
+  let pending: PendingBatch[] = batches.map((batch) => ({ batch, attempts: 0 }));
+
+  while (pending.length) {
+    let next = 0;
+    let halted = false;
+    const failures: Array<{ item: PendingBatch; error: unknown }> = [];
+    const worker = async (): Promise<void> => {
+      while (!halted && next < pending.length) {
+        const item = pending[next++];
+        try {
+          for (const [id, text] of await work(item.batch)) translated.set(id, text);
+        } catch (error) {
+          failures.push({ item, error });
+          halted = true;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, pending.length) }, worker));
+
+    const nonTransient = failures.find(({ error }) => !isTransient(error));
+    if (nonTransient) throw nonTransient.error;
+    if (!failures.length) {
+      pending = pending.slice(next);
+      continue;
     }
-  };
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, batches.length)) }, worker));
+
+    const retried = failures.map(({ item, error }) => ({ item: { ...item, attempts: item.attempts + 1 }, error }));
+    const longQuota = retried.find(({ error }) => error instanceof HttpError && (error.retryAfterMs || 0) > 30_000);
+    if (longQuota) throw longQuota.error;
+    const exhausted = retried.find(({ item }) => item.attempts >= maximumAttempts);
+    if (exhausted) throw exhausted.error;
+    pending = [...retried.map(({ item }) => item), ...pending.slice(next)];
+
+    const reduced = Math.max(1, Math.floor(limit / 2));
+    if (reduced < limit) {
+      console.warn(`Translation endpoint applied backpressure; reducing parallel workers from ${limit} to ${reduced}`);
+      limit = reduced;
+      options.onConcurrencyReduced?.(limit);
+    }
+    const requested = Math.max(0, ...retried.map(({ error }) => error instanceof HttpError ? error.retryAfterMs || 0 : 0));
+    const round = Math.max(...retried.map(({ item }) => item.attempts));
+    await wait(requested || Math.min(30_000, retryDelayMs * 2 ** (round - 1)));
+  }
   return translated;
 }
 
@@ -82,6 +145,9 @@ export async function runBatchResiliently(
   try {
     return await work(batch);
   } catch (error) {
+    // Transport and capacity failures do not become more recoverable when the
+    // payload is split. Let runBatches reduce pressure and retry the same work.
+    if (isTransient(error)) throw error;
     if (batch.length <= minimumSplitSize) throw error;
     const middle = Math.ceil(batch.length / 2);
     const left = await runBatchResiliently(batch.slice(0, middle), work, minimumSplitSize);

@@ -146,7 +146,7 @@ export function renderDashboard(data: DashboardData): string {
     <div class="grid">
       <section class="panel">
         <h2>AI translation usage</h2>
-        <p>${escapeHtml(config.translation.provider)} / ${escapeHtml(config.translation.model)}, ${number(config.translation.concurrency)} parallel workers, ${escapeHtml(config.translationMode)} mode.</p>
+        <p>${escapeHtml(config.translation.provider)} / ${escapeHtml(config.translation.model)}, up to ${number(config.translation.concurrency)} parallel workers with automatic backpressure, ${escapeHtml(config.translationMode)} mode.</p>
         <div class="facts">
           <div class="fact"><span>Generated titles</span><strong>${number(translated.length)}</strong><small>${number(translatedCues)} cues</small></div>
           <div class="fact"><span>Translation time</span><strong>${translationMs ? duration(translationMs) : "0 s"}</strong><small>Model stage total</small></div>
