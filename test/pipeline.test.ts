@@ -263,6 +263,21 @@ describe("subtitle pipeline", () => {
     expect(first.totalMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("identifies a release the same way however it was asked for", async () => {
+    // The play redirect knows only the stream; the subtitle list may also carry
+    // a filename. Both must name the same job or the pipeline runs twice.
+    const pipeline = new AutoSubPipeline(await config(), []);
+    const fromPlay = pipeline.releaseKey({ type: "movie", contentId: "tt1", languages: ["ar"] }, stream, "ar");
+    const fromList = pipeline.releaseKey(
+      { type: "movie", contentId: "tt1", languages: ["ar"], filename: stream.filename, videoSize: 42 },
+      stream,
+      "ar",
+    );
+    expect(fromList).toBe(fromPlay);
+    expect(pipeline.releaseKey(request, { ...stream, filename: "Other.mkv", url: "https://d/other" }, "ar")).not.toBe(fromPlay);
+    expect(pipeline.releaseKey(request, stream, "en")).not.toBe(fromPlay);
+  });
+
   it("refuses to run at all when audio analysis is disabled", async () => {
     const provider = new FakeProvider("fake", new Map());
     await expect(new AutoSubPipeline(await config({ AUDIO_ANALYSIS_ENABLED: "false" }), [provider]).complete(request, stream, "ar"))

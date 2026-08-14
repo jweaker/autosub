@@ -27,6 +27,24 @@ A mapping is rejected outright, whatever it scored, when it:
 | Activity | cue spans vs. VAD speech bins | fallback when transcription is unavailable |
 | Reference | cue start events vs. the trusted track's events | accepting a target-language subtitle |
 
+### Why a good match still needs a second look
+
+A cue is not a speech span. Subtitles appear shortly before their line and stay
+on screen after it, so the speech sits *inside* a wider cue. Overlap scoring is
+therefore flat across that padding — every offset within it scores the same —
+and the search alone will settle anywhere in that plateau. That is exactly what
+"validated, high confidence, and still slightly out of sync" looks like, and
+the wider the cues, the worse it gets.
+
+So identification and estimation are separated. The search decides *which*
+subtitle fits; speech onsets then decide *where* it sits. Each cue is anchored
+to the first transcribed word that belongs to it (or, with no transcript, to
+the nearest speech onset), and the median of those residuals shifts the whole
+mapping so cues lead their speech by the usual small margin. The correction is
+skipped entirely when the evidence disagrees by less than 250 ms — inside
+subtitling convention and below what a viewer notices — and is capped, so it
+can polish a mapping but never re-align the title.
+
 Only global corrections are applied: `newTime = oldTime × rate + offset`. The coarse sweep covers the frame-rate ratios that cause real drift (23.976↔25, 24↔25, 29.97↔30) plus small clock errors; the fine sweep refines to 50 ms and 0.01%. Per-cue nudging is deliberately not implemented — it can make a mismatched subtitle *look* aligned at every sampled point while being wrong everywhere else.
 
 ## Settings

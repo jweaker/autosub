@@ -22,6 +22,26 @@ interface FineSearch {
 }
 
 const ACTIVITY_FINE: FineSearch = { rateSpan: 0.003, rateStep: 0.0005, offsetSpan: 3_000 };
+// Speech is quieter than the cue that carries it: a subtitle appears shortly
+// before its line and lingers afterwards for reading time. Overlap scoring is
+// therefore flat across that padding, so the search alone cannot say where
+// inside the plateau the truth lies — these settle it from speech onsets.
+// A cue appears shortly before its line is spoken; these are the leads we
+// assume, and the deadband below is how far the evidence must disagree before
+// the mapping is moved at all. A quarter of a second is both the limit of
+// subtitling convention and roughly where a viewer starts to notice.
+const WORD_LEAD_MS = 150;
+const ONSET_LEAD_MS = 200;
+const REFINE_DEADBAND_MS = 250;
+const REFINE_LIMIT_MS = 900;
+const REFERENCE_DEADBAND_MS = 80;
+const REFERENCE_LIMIT_MS = 600;
+const MINIMUM_REFINE_PAIRS = 6;
+const MINIMUM_REFERENCE_PAIRS = 15;
+const ONSET_MERGE_GAP_MS = 400;
+const ONSET_SEARCH_MS = 1_200;
+const ONSET_EDGE_MS = 150;
+const WORD_SEARCH_MS = 1_500;
 const PRECISE_FINE: FineSearch = { rateSpan: 0.0015, rateStep: FINE_RATE_STEP, offsetSpan: 1_500 };
 
 function textTokens(text: string): Set<string> {
@@ -261,6 +281,124 @@ function crushedCues(cues: CueIndex, mapping: MappingScore): number {
   return lowerBound(cues.starts, limit);
 }
 
+function median(values: number[]): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/** Utterance starts, merging fragments the VAD split inside one sentence. */
+function onsetsFor(window: VadWindow): number[] {
+  const onsets: number[] = [];
+  let previousEnd = Number.NEGATIVE_INFINITY;
+  for (const interval of window.speech) {
+    // Speech already under way when the window opened has no usable onset.
+    const clipped = interval.startMs < ONSET_EDGE_MS;
+    if (!clipped && interval.startMs - previousEnd > ONSET_MERGE_GAP_MS) onsets.push(window.startMs + interval.startMs);
+    previousEnd = Math.max(previousEnd, interval.endMs);
+  }
+  return onsets;
+}
+
+/**
+ * Where each cue's own dialogue actually begins, from transcribed words.
+ *
+ * A word is attributed to the nearest cue that shares a token with it, and the
+ * earliest such word stands for the start of that cue's line. This is the
+ * sharpest anchor available: it says *which* line was spoken, not merely that
+ * someone was speaking.
+ */
+function wordAnchors(cues: CueIndex, windows: VadWindow[], states: WindowIndex[], offsetMs: number, rate: number): number[] {
+  const earliest = new Map<number, number>();
+  for (let index = 0; index < windows.length; index += 1) {
+    const window = windows[index];
+    const state = states[index];
+    if (!state.words.length) continue;
+    const from = cues.first((window.startMs - WORD_SEARCH_MS - offsetMs) / rate);
+    const to = cues.last((window.startMs + window.durationMs + WORD_SEARCH_MS - offsetMs) / rate);
+    for (const { word, tokens } of state.words) {
+      if (!tokens.size) continue;
+      const absoluteMs = window.startMs + word.startMs;
+      let bestCue = -1;
+      let bestDistance = WORD_SEARCH_MS;
+      for (let cue = from; cue < to; cue += 1) {
+        const startMs = (cues.starts[cue] * rate) + offsetMs;
+        const endMs = (cues.ends[cue] * rate) + offsetMs;
+        const distance = absoluteMs < startMs ? startMs - absoluteMs : absoluteMs > endMs ? absoluteMs - endMs : 0;
+        if (distance > bestDistance) continue;
+        const cueTokens = cues.tokensAt(cue);
+        let shares = false;
+        for (const token of tokens) {
+          if (cueTokens.has(token)) {
+            shares = true;
+            break;
+          }
+        }
+        if (!shares) continue;
+        bestCue = cue;
+        bestDistance = distance;
+        if (distance === 0) break;
+      }
+      if (bestCue < 0) continue;
+      const existing = earliest.get(bestCue);
+      if (existing === undefined || absoluteMs < existing) earliest.set(bestCue, absoluteMs);
+    }
+  }
+  return [...earliest].map(([cue, absoluteMs]) => absoluteMs - ((cues.starts[cue] * rate) + offsetMs));
+}
+
+/** Same idea from speech activity alone, for when nothing was transcribed. */
+function onsetAnchors(cues: CueIndex, windows: VadWindow[], offsetMs: number, rate: number): number[] {
+  const residuals: number[] = [];
+  for (const window of windows) {
+    const onsets = onsetsFor(window);
+    if (!onsets.length) continue;
+    const from = cues.first((window.startMs - offsetMs) / rate);
+    const to = cues.last((window.startMs + window.durationMs - offsetMs) / rate);
+    for (let cue = from; cue < to; cue += 1) {
+      const mapped = (cues.starts[cue] * rate) + offsetMs;
+      // Cues near the window edges pair with onsets that the window itself cut
+      // short, so they say more about the sampling than about the subtitle.
+      if (mapped < window.startMs + ONSET_EDGE_MS || mapped > window.startMs + window.durationMs - ONSET_EDGE_MS) continue;
+      let nearest = Number.POSITIVE_INFINITY;
+      for (const onset of onsets) {
+        if (Math.abs(onset - mapped) < Math.abs(nearest)) nearest = onset - mapped;
+      }
+      if (Math.abs(nearest) <= ONSET_SEARCH_MS) residuals.push(nearest);
+    }
+  }
+  return residuals;
+}
+
+/**
+ * How far the mapping should move so cues sit a consistent, small distance
+ * ahead of the speech they caption.
+ *
+ * The deadband keeps an already-good subtitle untouched, and the limit keeps
+ * this a polish step: it can correct the plateau, never re-align the title.
+ */
+function speechShift(cues: CueIndex, windows: VadWindow[], states: WindowIndex[], mapping: MappingScore): number {
+  // Transcribed words are the sharper anchor and sit closer to the cue start
+  // than a VAD onset does, so each carries its own expected lead.
+  let lead = WORD_LEAD_MS;
+  let residuals = wordAnchors(cues, windows, states, mapping.offsetMs, mapping.rate);
+  if (residuals.length < MINIMUM_REFINE_PAIRS) {
+    lead = ONSET_LEAD_MS;
+    residuals = onsetAnchors(cues, windows, mapping.offsetMs, mapping.rate);
+  }
+  if (residuals.length < MINIMUM_REFINE_PAIRS) return 0;
+  const shift = median(residuals) - lead;
+  if (Math.abs(shift) < REFINE_DEADBAND_MS) return 0;
+  return Math.max(-REFINE_LIMIT_MS, Math.min(REFINE_LIMIT_MS, shift));
+}
+
+/** Applies a shift only if the mapping still scores nearly as well afterwards. */
+function shifted(mapping: MappingScore, shift: number, evaluate: (offsetMs: number, rate: number) => MappingScore): MappingScore {
+  if (!shift) return mapping;
+  const candidate = evaluate(Math.round(mapping.offsetMs + shift), mapping.rate);
+  return candidate.score >= mapping.score * 0.7 ? candidate : mapping;
+}
+
 function resultForMapping(cues: SubtitleCue[], windows: VadWindow[], mapping: MappingScore, confidence: number): AlignmentResult {
   const aligned = cues.map((cue) => {
     const startMs = (cue.startMs * mapping.rate) + mapping.offsetMs;
@@ -286,12 +424,10 @@ export function alignSubtitle(cues: SubtitleCue[], windows: VadWindow[], maxOffs
   if (!cues.length || windows.length < 3) return unaligned(cues);
   const index = cueIndexFor(cues);
   const states = windowIndexFor(windows);
-  const { best, distinctiveness } = searchMapping(
-    (offsetMs, rate) => evaluateMapping(index, windows, states, offsetMs, rate),
-    maxOffsetMs,
-    ACTIVITY_FINE,
-  );
-  if (!best || rejected(index, best, maxOffsetMs, distinctiveness)) return unaligned(cues);
+  const evaluate = (offsetMs: number, rate: number): MappingScore => evaluateMapping(index, windows, states, offsetMs, rate);
+  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, ACTIVITY_FINE);
+  if (!found || rejected(index, found, maxOffsetMs, distinctiveness)) return unaligned(cues);
+  const best = shifted(found, speechShift(index, windows, states, found), evaluate);
 
   const strongWindows = best.windowScores.filter((score) => score >= 0.32).length;
   const signal = Math.min(1, Math.max(0, (best.score - 0.32) / 0.36));
@@ -381,12 +517,11 @@ export function alignSubtitleToTranscript(cues: SubtitleCue[], windows: VadWindo
   if (!cues.length) return unaligned(cues);
   const index = cueIndexFor(cues);
   const states = windowIndexFor(windows);
-  const { best, distinctiveness } = searchMapping(
-    (offsetMs, rate) => transcriptMappingScore(index, windows, states, offsetMs, rate),
-    maxOffsetMs,
-    PRECISE_FINE,
-  );
-  if (!best) return unaligned(cues);
+  const evaluate = (offsetMs: number, rate: number): MappingScore => transcriptMappingScore(index, windows, states, offsetMs, rate);
+  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, PRECISE_FINE);
+  if (!found) return unaligned(cues);
+  // The search says which subtitle fits; the speech onsets say exactly where.
+  const best = shifted(found, speechShift(index, windows, states, found), evaluate);
   const strong = best.windowScores.filter((score) => score >= 0.14).length;
   const requiredStrong = Math.max(2, Math.ceil(transcriptWindows * 0.6));
   const invalid = Math.abs(best.offsetMs) >= maxOffsetMs - COARSE_OFFSET_STEP_MS
@@ -456,6 +591,32 @@ function boundary(values: Float64Array, rate: number, shift: number, value: numb
   return lowerBound(values, (value - shift) / rate);
 }
 
+/**
+ * Median gap between each mapped target cue and the reference cue it lands on.
+ *
+ * Two subtitles for the same release segment dialogue differently, so
+ * individual pairs disagree; the median of a few hundred of them does not.
+ */
+function referenceShift(target: EventIndex, reference: EventIndex, mapping: MappingScore): number {
+  const residuals: number[] = [];
+  let cursor = 0;
+  for (const start of target.starts) {
+    const mapped = (start * mapping.rate) + mapping.offsetMs;
+    while (cursor + 1 < reference.starts.length && reference.starts[cursor + 1] <= mapped) cursor += 1;
+    let nearest = Number.POSITIVE_INFINITY;
+    for (const index of [cursor, cursor + 1]) {
+      if (index >= reference.starts.length) continue;
+      const gap = reference.starts[index] - mapped;
+      if (Math.abs(gap) < Math.abs(nearest)) nearest = gap;
+    }
+    if (Math.abs(nearest) <= REFERENCE_LIMIT_MS) residuals.push(nearest);
+  }
+  if (residuals.length < MINIMUM_REFERENCE_PAIRS) return 0;
+  const shift = median(residuals);
+  if (Math.abs(shift) < REFERENCE_DEADBAND_MS) return 0;
+  return Math.max(-REFERENCE_LIMIT_MS, Math.min(REFERENCE_LIMIT_MS, shift));
+}
+
 function eventSequenceScore(target: EventIndex, reference: EventIndex, offsetMs: number, rate: number): MappingScore {
   const lastTarget = target.starts.length ? (target.starts[target.starts.length - 1] * rate) + offsetMs : 0;
   const duration = Math.max(reference.starts[reference.starts.length - 1] || 0, lastTarget || 0);
@@ -486,12 +647,10 @@ export function alignSubtitleToReference(target: SubtitleCue[], reference: Subti
   if (target.length < 20 || reference.length < 20) return unaligned(target);
   const targetIndex = eventIndexFor(target);
   const referenceIndex = eventIndexFor(reference);
-  const { best, distinctiveness } = searchMapping(
-    (offsetMs, rate) => eventSequenceScore(targetIndex, referenceIndex, offsetMs, rate),
-    maxOffsetMs,
-    PRECISE_FINE,
-  );
-  if (!best) return unaligned(target);
+  const evaluate = (offsetMs: number, rate: number): MappingScore => eventSequenceScore(targetIndex, referenceIndex, offsetMs, rate);
+  const { best: found, distinctiveness } = searchMapping(evaluate, maxOffsetMs, PRECISE_FINE);
+  if (!found) return unaligned(target);
+  const best = shifted(found, referenceShift(targetIndex, referenceIndex, found), evaluate);
   const strong = best.windowScores.filter((score) => score >= 0.42).length;
   const crushed = lowerBound(targetIndex.starts, (-1_000 - best.offsetMs) / best.rate);
   const invalid = Math.abs(best.offsetMs) >= maxOffsetMs - COARSE_OFFSET_STEP_MS

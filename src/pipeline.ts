@@ -213,12 +213,19 @@ export class AutoSubPipeline {
     });
   }
 
-  /** Fingerprint of the release itself, stable across rejections. */
+  /**
+   * Fingerprint of the release itself, stable across rejections.
+   *
+   * Deliberately derived from the stream record alone. The play redirect and
+   * the subtitle list describe the same release with different detail — one
+   * knows the filename, the other may not — and keying on the request would
+   * split them into two jobs that each run the whole pipeline.
+   */
   releaseKey(request: SubtitleRequest, stream: StreamRecord, targetLanguage: string): string {
     return stableKey({
       type: request.type,
       id: request.contentId,
-      streamFingerprint: streamFingerprint(request, stream),
+      streamFingerprint: stream.videoHash || stream.filename || stableKey(stream.url),
       target: normalizeLanguage(targetLanguage) || targetLanguage,
     });
   }

@@ -81,6 +81,74 @@ describe("audio alignment", () => {
     expect(result.cues[0].startMs).toBe(cues[0].startMs);
   });
 
+  it("lands on the speech even though cue spans are padded around it", () => {
+    // A cue appears before its line and lingers after it, so overlap scoring is
+    // flat across that padding. Without a sharper anchor the search settles
+    // anywhere inside the plateau, which is what "slightly out of sync" is.
+    const cues: SubtitleCue[] = Array.from({ length: 200 }, (_, index) => ({
+      id: index + 1,
+      startMs: 10_000 + index * 6_000,
+      endMs: 10_000 + index * 6_000 + 3_800,
+      text: `spoken${index} term${index % 29} line${index % 17}`,
+    }));
+    const trueOffset = 5_000;
+    const lead = 300;
+    const trail = 1_100;
+    const starts = [30_000, 300_000, 600_000, 900_000];
+    const windows: VadWindow[] = starts.map((startMs) => {
+      const inside = cues.filter((cue) => cue.endMs + trueOffset >= startMs && cue.startMs + trueOffset <= startMs + 25_000);
+      return {
+        startMs,
+        durationMs: 25_000,
+        speech: inside.map((cue) => ({
+          startMs: Math.max(0, cue.startMs + trueOffset - startMs + lead),
+          endMs: Math.min(25_000, cue.endMs + trueOffset - startMs - trail),
+        })).filter((interval) => interval.endMs > interval.startMs),
+        transcript: inside.map((cue) => cue.text).join(" "),
+        words: inside.flatMap((cue) => cue.text.split(" ").map((word, index) => ({
+          word,
+          startMs: cue.startMs + trueOffset - startMs + lead + index * 500,
+          endMs: cue.startMs + trueOffset - startMs + lead + index * 500 + 400,
+          confidence: 0.9,
+        }))),
+      };
+    });
+
+    const result = alignSubtitleToTranscript(cues, windows, 30_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(Math.abs(result.offsetMs - trueOffset)).toBeLessThan(300);
+  });
+
+  it("leaves an already well-timed subtitle where it is", () => {
+    // Speech beginning a moment after the cue appears is exactly the convention
+    // subtitles are written to; nudging that would trade one small error for
+    // another.
+    const lead = 150;
+    const cues: SubtitleCue[] = Array.from({ length: 120 }, (_, index) => ({
+      id: index + 1,
+      startMs: 12_000 + index * 5_000,
+      endMs: 12_000 + index * 5_000 + 2_400,
+      text: `unique${index} word${index % 23}`,
+    }));
+    const starts = [20_000, 200_000, 400_000, 590_000];
+    const windows: VadWindow[] = starts.map((startMs) => {
+      const inside = cues.filter((cue) => cue.endMs >= startMs && cue.startMs <= startMs + 20_000);
+      return {
+        startMs,
+        durationMs: 20_000,
+        speech: inside.map((cue) => ({
+          startMs: Math.max(0, cue.startMs - startMs + lead),
+          endMs: Math.min(20_000, cue.endMs - startMs),
+        })).filter((interval) => interval.endMs > interval.startMs),
+        transcript: inside.map((cue) => cue.text).join(" "),
+      };
+    });
+
+    const result = alignSubtitleToTranscript(cues, windows, 20_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(Math.abs(result.offsetMs)).toBeLessThanOrEqual(150);
+  });
+
   it("uses transcribed words to identify a source-language timing track", () => {
     const cues: SubtitleCue[] = Array.from({ length: 120 }, (_, index) => ({
       id: index + 1,

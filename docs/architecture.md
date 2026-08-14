@@ -96,6 +96,8 @@ Three related searches share one machine (`searchMapping`): a coarse sweep over 
 | `alignSubtitleToTranscript` | cue text vs. transcribed words, plus activity | choosing the trusted source track |
 | `alignSubtitleToReference` | cue start events vs. a trusted track's events | accepting a target-language subtitle |
 
+Each search is followed by a refinement step, because the two questions differ: the score says which subtitle matches, but it is flat across the padding between a cue and the speech inside it, so it cannot say where within that plateau the truth lies. Cue starts are anchored to the transcribed words that belong to them (or to speech onsets when nothing transcribed), and the median residual shifts the mapping into convention. It is bounded and has a dead band, so it polishes rather than re-aligns.
+
 A mapping is `time → time * rate + offset`. Only globally consistent corrections are accepted; a subtitle that fits in one part of the film and not another scores low by construction, because scores are aggregated per window/section with a lower-quartile penalty and a coverage factor.
 
 Everything that depends only on the inputs — sorted cue times, per-cue token sets, speech bins, per-window word tokens — is computed once and cached by array identity, because the search evaluates thousands of mappings per candidate and evaluating one must be cheap. Cue ranges are resolved by binary search rather than scanning all cues.
