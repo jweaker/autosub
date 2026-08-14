@@ -30,6 +30,8 @@ export interface AppConfig {
   statusBanner: boolean;
   /** Add status and "try another" entries to the subtitle menu. */
   menuEntries: boolean;
+  /** How many "try another" rows to offer, each usable once per playback. */
+  retryEntries: number;
   /** How long the subtitle list waits before labelling a job as preparing. */
   statusProbeMs: number;
   /** How long a subtitle request waits for the play redirect to name the release. */
@@ -94,6 +96,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     statusMessages: env.STATUS_MESSAGES !== "false",
     statusBanner: env.STATUS_BANNER !== "false",
     menuEntries: env.MENU_ENTRIES !== "false",
+    retryEntries: asInt(env.RETRY_ENTRIES, 3, 0, 10),
     statusProbeMs: asInt(env.STATUS_PROBE_MS, 2_000, 0, 15_000),
     streamWaitMs: asInt(env.STREAM_WAIT_MS, 12_000, 100, 60_000),
     tmdbToken: env.TMDB_API_TOKEN,

@@ -42,7 +42,7 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.3.0",
+  version: "1.4.0",
   name: "AutoSub",
   description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback",
   resources: [
@@ -228,7 +228,16 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     } else if (snapshot?.state === "failed") {
       entries.push({ id: `autosub-status-${jobId}`, url: fileUrl(`file/${jobId}.srt`), lang: failedLabel() });
     }
-    entries.push({ id: `autosub-next-${jobId}`, url: fileUrl(`next/${jobId}.srt`), lang: retryLabel(language) });
+    // One row per attempt: each has its own URL, so a viewer can reject three
+    // subtitles in a row without leaving the player. Selecting any of them
+    // means the same thing — "not this one, give me the next".
+    for (let attempt = 1; attempt <= config.retryEntries; attempt += 1) {
+      entries.push({
+        id: `autosub-next-${jobId}-${attempt}`,
+        url: fileUrl(`next/${jobId}/${attempt}.srt`),
+        lang: retryLabel(language, attempt),
+      });
+    }
     return entries;
   }
 
@@ -311,10 +320,10 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     }
   });
 
-  // Selecting this entry in the subtitle menu says "this one is wrong": the
-  // delivered subtitle is remembered as rejected and the next best candidate is
-  // prepared in its place.
-  app.get("/:token/next/:jobId.srt", authorized, async (request, response, next) => {
+  // Selecting one of these entries says "this one is wrong": the delivered
+  // subtitle is remembered as rejected and the next best candidate is prepared
+  // in its place. The attempt number only makes the URL unique.
+  async function serveNext(request: Request, response: Response, next: NextFunction): Promise<void> {
     const jobId = String(request.params.jobId);
     try {
       const result = await jobs.retry(jobId, config.jobWaitMs);
@@ -330,6 +339,13 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     } catch (error) {
       respondToFailure(response, next, error, jobId);
     }
+  }
+
+  app.get("/:token/next/:jobId.srt", authorized, (request, response, next) => {
+    void serveNext(request, response, next);
+  });
+  app.get("/:token/next/:jobId/:attempt.srt", authorized, (request, response, next) => {
+    void serveNext(request, response, next);
   });
 
   app.use((error: unknown, request: Request, response: Response, _next: NextFunction) => {

@@ -13,7 +13,7 @@
 | `GET /:token/play/:playId` | Records the release, starts preparation, 302s to the debrid URL |
 | `GET /:token/subtitles/:type/:id[/:extra].json` | Subtitle list for the release being played |
 | `GET /:token/file/:jobId.srt` | The finished subtitle |
-| `GET /:token/next/:jobId.srt` | Rejects the current subtitle and serves the next candidate |
+| `GET /:token/next/:jobId[/:attempt].srt` | Rejects the current subtitle and serves the next candidate |
 
 Anything with a wrong token returns 404, compared in constant time.
 

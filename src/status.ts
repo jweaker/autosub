@@ -27,9 +27,13 @@ export function failedLabel(): string {
 /**
  * Reads as a language row because the protocol has no other place to put it,
  * so it names the language first and the action second.
+ *
+ * Attempts are numbered because each one is a separate row with its own URL:
+ * a player will not re-request a track it already has, so a single row could
+ * only ever be used once per playback.
  */
-export function retryLabel(language: string): string {
-  return `${languageName(language)} - try another (AutoSub)`;
+export function retryLabel(language: string, attempt = 1): string {
+  return `${languageName(language)} - try another${attempt > 1 ? ` #${attempt}` : ""} (AutoSub)`;
 }
 
 /** One-line summary of what was delivered, shown briefly at the start of playback. */

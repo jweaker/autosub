@@ -57,11 +57,15 @@ GET /:token/subtitles/:type/:id.json
 GET /:token/file/:jobId.srt
     └─ JobManager.result          (awaits the shared job, up to JOB_WAIT_MS)
 
-GET /:token/next/:jobId.srt
+GET /:token/next/:jobId[/:attempt].srt
     ├─ RejectionStore.add         (this release will never serve that file again)
     ├─ JobManager.start           (same release, larger exclusion set)
     └─ the replacement subtitle
 ```
+
+The attempt number carries no meaning beyond making each retry row a distinct
+URL: players do not re-request a track they have already loaded, so a single
+shared URL could only be used once per playback.
 
 The subtitle list is requested *before* or *around* the play redirect depending on the client, which is why `waitFor` exists: it blocks briefly on the registry rather than returning an empty list.
 

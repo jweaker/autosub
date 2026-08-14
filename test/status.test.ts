@@ -31,6 +31,11 @@ describe("status labels", () => {
     expect(failedLabel()).toBe("AutoSub: nothing matched this release");
   });
 
+  it("numbers further attempts so they read as successive tries", () => {
+    expect(retryLabel("ar", 2)).toBe("Arabic - try another #2 (AutoSub)");
+    expect(retryLabel("ar", 3)).toBe("Arabic - try another #3 (AutoSub)");
+  });
+
   it("keeps labels free of symbols that TV fonts may not have", () => {
     const labels = [resultLabel(result()), failedLabel(), retryLabel("ar"), bannerText(result())];
     for (const label of labels) expect(label).toMatch(/^[\x20-\x7E]+$/);

@@ -37,6 +37,7 @@ Stremio gives an addon no way to show a spinner, so AutoSub reports itself throu
 |---|---|
 | `Arabic` | The normal entry. Your preferred-language setting still auto-selects it. |
 | `Arabic - try another (AutoSub)` | Select this if the subtitle is wrong. |
+| `Arabic - try another #2 / #3` | Same thing again, for a second and third rejection. |
 | `AutoSub: found on opensubtitles (81%)` | Shown on a warm play, when the answer is already known. |
 | `AutoSub: AI translated from English (74%)` | Same, for a translated result. |
 
@@ -44,7 +45,9 @@ The protocol gives an addon three fields per row — `id`, `url`, `lang` — and
 
 Progress lives in the subtitle instead, which is generated when it is requested and so is always current. The delivered file opens with one short line naming its origin — `[AutoSub] opensubtitles subtitle - 81% match` — that clears after a few seconds. If preparation is still running past `JOB_WAIT_MS`, or nothing passed validation, you get a readable message on screen instead of silence.
 
-**"Try another" marks the current subtitle as bad**, remembers that permanently for this release, and prepares the next best candidate. The rejection survives restarts, so the same file is never handed back, and the audio analysis is reused, which makes a second attempt take seconds rather than another full run. Selecting it again moves to the one after that; when nothing is left, it says so.
+**"Try another" marks the current subtitle as bad**, remembers that permanently for this release, and returns the next best candidate in the same response — the new subtitle simply appears, with no need to switch back to the plain language row. The rejection survives restarts, so the same file is never handed back, and the audio analysis is reused, which makes each further attempt take seconds rather than another full run. When nothing is left, it says so.
+
+The numbered rows exist because a player will not re-request a subtitle it has already loaded, so one row could only ever be used once per playback. Three rows mean three rejections without leaving the player; `RETRY_ENTRIES` sets how many (0 for none).
 
 Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` or `STATUS_MESSAGES=false` to get the plain single-entry behaviour back.
 
@@ -130,7 +133,8 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `CANDIDATE_LIMIT` | `10` | Candidates downloaded and validated per language |
 | `JOB_WAIT_MS` | `120000` | How long a subtitle request waits for preparation |
 | `CACHE_TTL_DAYS` | `30` | Age at which cached subtitles are swept |
-| `MENU_ENTRIES` | `true` | Add the "try another" row, and a result row on warm plays |
+| `MENU_ENTRIES` | `true` | Add the "try another" rows, and a result row on warm plays |
+| `RETRY_ENTRIES` | `3` | How many "try another" rows, each usable once per playback |
 | `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |

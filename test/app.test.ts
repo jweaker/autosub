@@ -105,12 +105,37 @@ describe("addon HTTP surface", () => {
     await playStream();
     const subtitles = await listSubtitles();
 
-    expect(subtitles).toHaveLength(3);
     expect(subtitles[0].lang).toBe("ara");
     expect(subtitles[1].lang).toContain("found on opensubtitles");
     expect(subtitles[1].lang).toContain("81%");
-    expect(subtitles[2].lang).toBe("Arabic - try another (AutoSub)");
-    expect(subtitles[2].url).toContain("/next/");
+    expect(subtitles.slice(2).map((entry) => entry.lang)).toEqual([
+      "Arabic - try another (AutoSub)",
+      "Arabic - try another #2 (AutoSub)",
+      "Arabic - try another #3 (AutoSub)",
+    ]);
+    // Distinct URLs, because a player will not re-request a track it already
+    // loaded — one shared URL could only ever be used once per playback.
+    const retryUrls = new Set(subtitles.slice(2).map((entry) => entry.url));
+    expect(retryUrls.size).toBe(3);
+  });
+
+  it("walks further down the list on each retry row", async () => {
+    const order = ["opensubtitles:1", "subdl:2", "subsource:3", "subdl:4"];
+    const complete = vi.fn(async (_request, _stream, _language, exclude: string[] = []) => {
+      const id = order[exclude.length];
+      if (!id) throw new Error("No subtitle in en matched the transcribed audio");
+      return subtitle({ id, provider: id.split(":")[0], confidence: 90 - exclude.length });
+    });
+    await start(complete as unknown as AutoSubPipeline["complete"]);
+    await playStream();
+    const entries = await listSubtitles();
+    const retries = entries.filter((entry) => entry.url.includes("/next/"));
+
+    const variants = [];
+    for (const retry of retries) variants.push((await fetch(local(retry.url))).headers.get("x-autosub-variant"));
+    expect(variants).toEqual(["subdl:2", "subsource:3", "subdl:4"]);
+    // Whatever the viewer settles on is what the plain language row serves.
+    expect((await fetch(local(entries[0].url))).headers.get("x-autosub-variant")).toBe("subdl:4");
   });
 
   it("says AI translated when the result came from the model", async () => {
@@ -123,12 +148,19 @@ describe("addon HTTP surface", () => {
   it("shows no status row while work is still running", async () => {
     // The player fetches this list once, so a "preparing" row written now would
     // still claim to be preparing long after the subtitle arrived.
-    await start(() => new Promise<CompletedSubtitle>(() => undefined), { STATUS_PROBE_MS: "50" });
+    await start(() => new Promise<CompletedSubtitle>(() => undefined), { STATUS_PROBE_MS: "50", RETRY_ENTRIES: "1" });
     await playStream();
     const subtitles = await listSubtitles();
     expect(subtitles).toHaveLength(2);
     expect(subtitles[0].lang).toBe("ara");
     expect(subtitles[1].lang).toBe("Arabic - try another (AutoSub)");
+  });
+
+  it("can be trimmed to a single row", async () => {
+    await start(async () => subtitle(), { RETRY_ENTRIES: "0" });
+    await playStream();
+    const subtitles = await listSubtitles();
+    expect(subtitles.filter((entry) => entry.url.includes("/next/"))).toHaveLength(0);
   });
 
   it("shows why nothing arrived when preparation already failed", async () => {
