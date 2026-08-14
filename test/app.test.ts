@@ -94,7 +94,10 @@ describe("addon HTTP surface", () => {
     await start(async () => subtitle());
     expect((await fetch(`${base}/${TOKEN}/manifest.json`)).status).toBe(200);
     expect((await fetch(`${base}/wrong-token/manifest.json`)).status).toBe(404);
-    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    // The version is in the health response so a deployment can be checked
+    // without a token.
+    const health = await (await fetch(`${base}/healthz`)).json() as { version: string };
+    expect(health.version).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   it("lists the language entry plus a status and a retry entry", async () => {

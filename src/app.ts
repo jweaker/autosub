@@ -42,7 +42,7 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.2.0",
+  version: "1.3.0",
   name: "AutoSub",
   description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback",
   resources: [
@@ -125,6 +125,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     response.setHeader("Cache-Control", "no-store");
     response.json({
       ok: true,
+      version: manifest.version,
       upstream: upstream.enabled,
       audioAnalysis: config.audioAnalysisEnabled,
       providers: providers.map((provider) => provider.name),
