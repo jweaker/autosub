@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, speechOffsetError } from "./alignment.js";
+import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, snapToSpeech, speechOffsetError } from "./alignment.js";
 import { AudioAnalyzer } from "./audio.js";
 import { stableKey, SubtitleCache } from "./cache.js";
 import type { AppConfig } from "./config.js";
@@ -354,13 +354,19 @@ export class AutoSubPipeline {
    * wrong in its own way; this asks the one question none of them ask directly,
    * which is whether the finished subtitle lands on the speech.
    */
-  private landsOnSpeech(content: string, probe: AudioProbeResult, label: string): boolean {
-    const error = speechOffsetError(parseSrt(content), probe.windows);
+  private settleOnSpeech(content: string, probe: AudioProbeResult, label: string): string | undefined {
+    const cues = parseSrt(content);
+    const snapped = snapToSpeech(cues, probe.windows);
+    if (snapped) console.log(`Pulled ${label} ${snapped.shiftMs > 0 ? "later" : "earlier"} by ${Math.abs(snapped.shiftMs)}ms to sit on the speech`);
+    const settled = snapped?.cues || cues;
+
+    const error = speechOffsetError(settled, probe.windows);
     this.lastSpeechError = error;
-    if (error === undefined) return true;
-    if (Math.abs(error) <= SPEECH_ERROR_LIMIT_MS) return true;
-    console.warn(`Refusing ${label}: it sits ${error}ms from the speech in the sampled audio`);
-    return false;
+    if (error !== undefined && Math.abs(error) > SPEECH_ERROR_LIMIT_MS) {
+      console.warn(`Refusing ${label}: it still sits ${error}ms from the speech in the sampled audio`);
+      return undefined;
+    }
+    return snapped ? serializeSrt(settled) : content;
   }
 
   private async store(result: CompletedSubtitle): Promise<CompletedSubtitle> {
@@ -471,12 +477,15 @@ export class AutoSubPipeline {
       if (!source) break;
       log("Trusted timing", source, probe, started, stages);
 
-      if (sourceLanguages.includes(target) && this.landsOnSpeech(source.content, probe, `${source.ranked.candidate.provider}:${source.ranked.candidate.providerId}`)) {
+      const settledSource = sourceLanguages.includes(target)
+        ? this.settleOnSpeech(source.content, probe, variantId(source.ranked.candidate))
+        : undefined;
+      if (settledSource) {
         const result = await this.store({
           key,
           id: variantId(source.ranked.candidate),
           language: target,
-          content: source.content,
+          content: settledSource,
           confidence: source.confidence,
           provider: source.ranked.candidate.provider,
           translated: false,
@@ -492,13 +501,14 @@ export class AutoSubPipeline {
         (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
         excluded,
       ));
-      if (direct && this.landsOnSpeech(direct.content, probe, `${direct.ranked.candidate.provider}:${direct.ranked.candidate.providerId}`)) {
+      const settledDirect = direct ? this.settleOnSpeech(direct.content, probe, variantId(direct.ranked.candidate)) : undefined;
+      if (direct && settledDirect) {
         log(`Direct ${target} subtitle`, direct, probe, started, stages);
         const result = await this.store({
           key,
           id: variantId(direct.ranked.candidate),
           language: target,
-          content: direct.content,
+          content: settledDirect,
           confidence: Math.min(source.confidence, direct.confidence),
           provider: direct.ranked.candidate.provider,
           translated: false,
@@ -518,8 +528,9 @@ export class AutoSubPipeline {
     // is what matters for a film whose original language has a handful of
     // subtitles but whose English catalogue has hundreds.
     const fallback = await this.matchWithoutSpokenSource(request, probe, targetCandidates, excluded, sourceLanguages, target, mark, rejectedSources.size > excluded.size);
-    if (fallback && this.landsOnSpeech(fallback.subtitle.content, probe, fallback.subtitle.id)) {
-      const result = await this.store({ key, ...fallback.subtitle });
+    const settledFallback = fallback ? this.settleOnSpeech(fallback.subtitle.content, probe, fallback.subtitle.id) : undefined;
+    if (fallback && settledFallback) {
+      const result = await this.store({ key, ...fallback.subtitle, content: settledFallback });
       log(`Fallback ${target} subtitle`, fallback.evaluated, probe, started, stages);
       summary("direct", result, undefined, fallback.route);
       return result;

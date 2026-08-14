@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, speechOffsetError } from "../src/alignment.js";
+import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, snapToSpeech, speechOffsetError } from "../src/alignment.js";
 import type { SubtitleCue, VadWindow } from "../src/domain.js";
 
 describe("audio alignment", () => {
@@ -298,5 +298,52 @@ describe("audio alignment", () => {
     expect(speechOffsetError(cues, speechFor(-2_000)) as number).toBeLessThan(-1_500);
     // Nothing to measure against.
     expect(speechOffsetError(cues, [])).toBeUndefined();
+  });
+
+  it("pulls a subtitle that missed the speech back onto it", () => {
+    // Whatever a route inherited from its reference, the audio has the final
+    // say — and because the measurement is signed, it is also the correction.
+    const cues: SubtitleCue[] = Array.from({ length: 150 }, (_, index) => ({
+      id: index + 1,
+      startMs: 15_000 + index * 6_000,
+      endMs: 15_000 + index * 6_000 + 2_500,
+      text: `line${index}`,
+    }));
+    const windows: VadWindow[] = [30_000, 300_000, 600_000, 800_000].map((startMs) => ({
+      startMs,
+      durationMs: 20_000,
+      speech: cues.flatMap((cue) => {
+        const from = cue.startMs + 1_500 - startMs + 200;
+        const to = cue.endMs + 1_500 - startMs;
+        return to > 0 && from < 20_000 ? [{ startMs: Math.max(0, from), endMs: Math.min(20_000, to) }] : [];
+      }),
+    }));
+
+    const snapped = snapToSpeech(cues, windows);
+    expect(snapped).toBeDefined();
+    expect(snapped?.shiftMs).toBeGreaterThan(1_200);
+    expect(Math.abs(speechOffsetError(snapped?.cues as SubtitleCue[], windows) as number)).toBeLessThan(200);
+    // Cue durations and order survive the move.
+    expect(snapped?.cues).toHaveLength(cues.length);
+    expect((snapped?.cues[10].endMs as number) - (snapped?.cues[10].startMs as number)).toBe(2_500);
+  });
+
+  it("leaves a subtitle alone when it already sits on the speech", () => {
+    const cues: SubtitleCue[] = Array.from({ length: 120 }, (_, index) => ({
+      id: index + 1,
+      startMs: 20_000 + index * 5_000,
+      endMs: 20_000 + index * 5_000 + 2_000,
+      text: `line${index}`,
+    }));
+    const windows: VadWindow[] = [40_000, 200_000, 400_000, 550_000].map((startMs) => ({
+      startMs,
+      durationMs: 20_000,
+      speech: cues.flatMap((cue) => {
+        const from = cue.startMs - startMs + 180;
+        const to = cue.endMs - startMs;
+        return to > 0 && from < 20_000 ? [{ startMs: Math.max(0, from), endMs: Math.min(20_000, to) }] : [];
+      }),
+    }));
+    expect(snapToSpeech(cues, windows)).toBeUndefined();
   });
 });

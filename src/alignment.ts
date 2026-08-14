@@ -62,6 +62,8 @@ const ONSET_MERGE_GAP_MS = 400;
 const ONSET_SEARCH_MS = 1_200;
 const ONSET_EDGE_MS = 150;
 const MEASURE_SEARCH_MS = 4_000;
+const SNAP_DEADBAND_MS = 300;
+const SNAP_LIMIT_MS = 4_000;
 const WORD_SEARCH_MS = 1_500;
 const PRECISE_FINE: FineSearch = { rateSpan: 0.0015, rateStep: FINE_RATE_STEP, offsetSpan: 1_500 };
 
@@ -416,6 +418,30 @@ export function speechOffsetError(cues: SubtitleCue[], windows: VadWindow[]): nu
   // here are exactly the ones too large for refinement to consider.
   const residuals = onsetAnchors(cueIndexFor(cues), windows, 0, 1, MEASURE_SEARCH_MS);
   return residuals.length >= MINIMUM_REFINE_PAIRS ? Math.round(median(residuals) - ONSET_LEAD_MS) : undefined;
+}
+
+/**
+ * Pulls a finished subtitle onto the speech it captions.
+ *
+ * Every route inherits whatever error its reference carried, and a reference
+ * more than a second out is invisible to the refinement inside alignment,
+ * whose search radius is narrower than the mistake. Measuring the finished
+ * article against the audio catches that wherever it came from, and since the
+ * measurement is signed, the fix is the measurement.
+ */
+export function snapToSpeech(cues: SubtitleCue[], windows: VadWindow[]): { cues: SubtitleCue[]; shiftMs: number } | undefined {
+  const error = speechOffsetError(cues, windows);
+  if (error === undefined || Math.abs(error) < SNAP_DEADBAND_MS) return undefined;
+  const shiftMs = Math.max(-SNAP_LIMIT_MS, Math.min(SNAP_LIMIT_MS, error));
+  const shifted = cues.map((cue) => ({
+    ...cue,
+    startMs: Math.max(0, cue.startMs + shiftMs),
+    endMs: Math.max(Math.max(0, cue.startMs + shiftMs) + 250, cue.endMs + shiftMs),
+  }));
+  // Only worth keeping if it actually improved matters.
+  const after = speechOffsetError(shifted, windows);
+  if (after !== undefined && Math.abs(after) >= Math.abs(error)) return undefined;
+  return { cues: shifted, shiftMs };
 }
 
 /** Same idea from speech activity alone, for when nothing was transcribed. */
