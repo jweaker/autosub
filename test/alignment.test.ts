@@ -1,0 +1,138 @@
+import { describe, expect, it } from "vitest";
+import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript } from "../src/alignment.js";
+import type { SubtitleCue, VadWindow } from "../src/domain.js";
+
+describe("audio alignment", () => {
+  it("finds and applies a constant subtitle offset", () => {
+    let cursor = 500;
+    const cues: SubtitleCue[] = Array.from({ length: 40 }, (_, index) => {
+      cursor += 1_900 + ((index * 1777) % 4_300);
+      return {
+        id: index + 1,
+        startMs: cursor,
+        endMs: cursor + 700 + ((index * 613) % 1_400),
+        text: `Line ${index + 1}`,
+      };
+    });
+    const trueOffset = 3_500;
+    const starts = [0, 30_000, 60_000, 90_000, 120_000];
+    const windows: VadWindow[] = starts.map((startMs) => ({
+      startMs,
+      durationMs: 24_000,
+      speech: cues.flatMap((cue) => {
+        const start = cue.startMs + trueOffset - startMs;
+        const end = cue.endMs + trueOffset - startMs;
+        return end > 0 && start < 24_000 ? [{ startMs: Math.max(0, start), endMs: Math.min(24_000, end) }] : [];
+      }),
+    }));
+    const result = alignSubtitle(cues, windows, 10_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(result.offsetMs).toBeCloseTo(trueOffset, -2);
+    expect(result.cues[10].startMs).toBeCloseTo(cues[10].startMs + trueOffset, -2);
+  });
+
+  it("refuses unrelated activity", () => {
+    const cues: SubtitleCue[] = Array.from({ length: 20 }, (_, index) => ({
+      id: index + 1, startMs: index * 5_000, endMs: index * 5_000 + 900, text: "x",
+    }));
+    const windows: VadWindow[] = [0, 30_000, 60_000].map((startMs) => ({
+      startMs, durationMs: 20_000, speech: [{ startMs: 2_500, endMs: 2_800 }, { startMs: 14_100, endMs: 14_400 }],
+    }));
+    expect(alignSubtitle(cues, windows, 5_000).confidence).toBeLessThan(58);
+  });
+
+  it("corrects a common 23.976-to-25fps timing drift with one global model", () => {
+    let cursor = 2_000;
+    const cues: SubtitleCue[] = Array.from({ length: 260 }, (_, index) => {
+      cursor += 2_100 + ((index * 977) % 3_700);
+      return { id: index + 1, startMs: cursor, endMs: cursor + 850 + ((index * 313) % 900), text: `Line ${index + 1}` };
+    });
+    const rate = 1.042709;
+    const offset = 1_500;
+    const starts = [30_000, 180_000, 360_000, 540_000, 720_000, 900_000];
+    const windows: VadWindow[] = starts.map((startMs) => ({
+      startMs,
+      durationMs: 20_000,
+      speech: cues.flatMap((cue) => {
+        const start = (cue.startMs * rate) + offset - startMs;
+        const end = (cue.endMs * rate) + offset - startMs;
+        return end > 0 && start < 20_000 ? [{ startMs: Math.max(0, start), endMs: Math.min(20_000, end) }] : [];
+      }),
+    }));
+    const result = alignSubtitle(cues, windows, 20_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(result.cues[180].startMs).toBeCloseTo((cues[180].startMs * rate) + offset, -2);
+  });
+
+  it("rejects an extreme correction that would crush early cues to zero", () => {
+    const cues: SubtitleCue[] = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      startMs: 5_000 + index * 4_000,
+      endMs: 6_200 + index * 4_000,
+      text: "x",
+    }));
+    const windows: VadWindow[] = [30_000, 90_000, 150_000, 210_000].map((startMs) => ({
+      startMs,
+      durationMs: 15_000,
+      speech: [{ startMs: 1_000, endMs: 8_000 }, { startMs: 9_000, endMs: 14_000 }],
+    }));
+    const result = alignSubtitle(cues, windows, 180_000);
+    expect(result.confidence).toBe(0);
+    expect(result.cues[0].startMs).toBe(cues[0].startMs);
+  });
+
+  it("uses transcribed words to identify a source-language timing track", () => {
+    const cues: SubtitleCue[] = Array.from({ length: 120 }, (_, index) => ({
+      id: index + 1,
+      startMs: 10_000 + index * 5_000,
+      endMs: 12_000 + index * 5_000,
+      text: `uniqueword${index} anotherterm${index}`,
+    }));
+    const offset = 2_500;
+    const starts = [20_000, 150_000, 300_000, 450_000];
+    const windows: VadWindow[] = starts.map((startMs) => {
+      const matching = cues.filter((cue) => cue.endMs + offset >= startMs && cue.startMs + offset <= startMs + 20_000);
+      return {
+        startMs,
+        durationMs: 20_000,
+        speech: matching.map((cue) => ({ startMs: Math.max(0, cue.startMs + offset - startMs), endMs: Math.min(20_000, cue.endMs + offset - startMs) })),
+        transcript: matching.map((cue) => cue.text).join(" "),
+      };
+    });
+    const result = alignSubtitleToTranscript(cues, windows, 20_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(result.cues[40].startMs).toBeCloseTo(cues[40].startMs + offset, -3);
+  });
+
+  it("aligns a target-language track only when its events match a trusted reference", () => {
+    let cursor = 8_000;
+    const reference: SubtitleCue[] = Array.from({ length: 180 }, (_, index) => {
+      cursor += 1_700 + ((index * 1777) % 5_300);
+      return { id: index + 1, startMs: cursor, endMs: cursor + 900 + ((index * 313) % 1_100), text: `Reference ${index}` };
+    });
+    const offset = 3_000;
+    const target = reference.map((cue) => ({ ...cue, startMs: cue.startMs - offset, endMs: cue.endMs - offset, text: `Arabic ${cue.id}` }));
+    const result = alignSubtitleToReference(target, reference, 20_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(result.cues[100].startMs).toBeCloseTo(reference[100].startMs, -2);
+  });
+
+  it("removes sub-second offset and small clock drift without a timing plateau", () => {
+    let cursor = 4_000;
+    const reference: SubtitleCue[] = Array.from({ length: 240 }, (_, index) => {
+      cursor += 1_800 + ((index * 1237) % 4_900);
+      return { id: index + 1, startMs: cursor, endMs: cursor + 1_100, text: `Reference ${index}` };
+    });
+    const rate = 1.0007;
+    const offset = 275;
+    const target = reference.map((cue) => ({
+      ...cue,
+      startMs: (cue.startMs - offset) / rate,
+      endMs: (cue.endMs - offset) / rate,
+      text: `Target ${cue.id}`,
+    }));
+    const result = alignSubtitleToReference(target, reference, 10_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(Math.abs(result.cues[180].startMs - reference[180].startMs)).toBeLessThan(75);
+  });
+});

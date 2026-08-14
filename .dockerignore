@@ -1,0 +1,12 @@
+node_modules
+dist
+data
+.env
+.git
+test
+*.log
+docs
+.github
+README.md
+SECURITY.md
+LICENSE

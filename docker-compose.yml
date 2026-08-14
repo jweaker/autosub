@@ -1,0 +1,26 @@
+services:
+  autosub:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Reaps orphaned ffmpeg/python children if a sample is killed mid-run.
+    init: true
+    volumes:
+      - ./data:/app/data
+    ports:
+      # Bound to loopback on purpose: Cloudflared is the only way in.
+      - "127.0.0.1:7000:7000"
+    # Matches the server's own shutdown deadline so in-flight work can finish.
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      # Keeps a Raspberry Pi SD card from filling with container logs.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
