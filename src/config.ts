@@ -22,6 +22,16 @@ export interface AppConfig {
   streamTtlMs: number;
   cacheTtlMs: number;
   rateLimitPerMinute: number;
+  /** Deliver progress and failure notices as a readable subtitle track. */
+  statusMessages: boolean;
+  /** Prepend a short "what you are watching" cue to finished subtitles. */
+  statusBanner: boolean;
+  /** Add status and "try another" entries to the subtitle menu. */
+  menuEntries: boolean;
+  /** How long the subtitle list waits before labelling a job as preparing. */
+  statusProbeMs: number;
+  /** How long a subtitle request waits for the play redirect to name the release. */
+  streamWaitMs: number;
   tmdbToken?: string;
   gemini: { apiKey?: string; model: string; concurrency: number };
   deepgram: { apiKey?: string; model: string };
@@ -78,6 +88,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     streamTtlMs: asNumber(env.STREAM_TTL_HOURS, 6, 0.25, 168) * 3_600_000,
     cacheTtlMs: asNumber(env.CACHE_TTL_DAYS, 30, 0, 3_650) * 86_400_000,
     rateLimitPerMinute: asInt(env.RATE_LIMIT_PER_MINUTE, 180, 10, 100_000),
+    statusMessages: env.STATUS_MESSAGES !== "false",
+    statusBanner: env.STATUS_BANNER !== "false",
+    menuEntries: env.MENU_ENTRIES !== "false",
+    statusProbeMs: asInt(env.STATUS_PROBE_MS, 2_000, 0, 15_000),
+    streamWaitMs: asInt(env.STREAM_WAIT_MS, 12_000, 100, 60_000),
     tmdbToken: env.TMDB_API_TOKEN,
     gemini: {
       apiKey: env.GEMINI_API_KEY,

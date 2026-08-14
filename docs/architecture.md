@@ -10,18 +10,21 @@ AutoSub solves this by also being the *stream* addon. It wraps the upstream (deb
 
 Two consequences follow from that decision, and they explain most of the code:
 
-- **The play redirect is the only identity signal**, so it must start work immediately (`server.ts` → `JobManager.start`) and the registry that remembers it must survive restarts (`streams.ts`).
+- **The play redirect is the only identity signal**, so it must start work immediately (`app.ts` → `JobManager.start`) and the registry that remembers it must survive restarts (`streams.ts`).
 - **Everything downstream is verifiable**, so a subtitle is never accepted on a name match alone. Matching is a numerical fit against the audio (`alignment.ts`), and a failure to fit is reported as a failure, not as a best guess.
 
 ## Module map
 
 | Module | Responsibility |
 |---|---|
-| `server.ts` | HTTP surface, token authorization, rate limiting, error mapping, shutdown |
+| `server.ts` | Process bootstrap: wiring, listener, maintenance timers, shutdown |
+| `app.ts` | HTTP surface, token authorization, rate limiting, error mapping |
 | `config.ts` | Environment parsing, range clamping, startup warnings |
 | `streams.ts` | Upstream addon client and the play-link registry |
 | `request.ts` | Parsing Stremio's subtitle request format |
-| `jobs.ts` | One pipeline run per release/language, shared by all waiters |
+| `jobs.ts` | One pipeline run per release/language/rejection set, shared by all waiters |
+| `status.ts` | Menu labels, origin banner, and message tracks |
+| `rejections.ts` | Subtitles the viewer marked as wrong, per release |
 | `pipeline.ts` | Orchestration: search → validate → translate → cache |
 | `audio.ts` | ffprobe/ffmpeg sampling, VAD, Deepgram transcription |
 | `process.ts` | Child-process execution with timeouts and output limits |
@@ -53,6 +56,11 @@ GET /:token/subtitles/:type/:id.json
 
 GET /:token/file/:jobId.srt
     └─ JobManager.result          (awaits the shared job, up to JOB_WAIT_MS)
+
+GET /:token/next/:jobId.srt
+    ├─ RejectionStore.add         (this release will never serve that file again)
+    ├─ JobManager.start           (same release, larger exclusion set)
+    └─ the replacement subtitle
 ```
 
 The subtitle list is requested *before* or *around* the play redirect depending on the client, which is why `waitFor` exists: it blocks briefly on the registry rather than returning an empty list.
@@ -61,12 +69,14 @@ The subtitle list is requested *before* or *around* the play redirect depending 
 
 `AutoSubPipeline.complete()` runs the expensive path once per release and language:
 
-1. **Cache probe.** The key covers the media fingerprint, the target language, and the translation model, so changing the model invalidates translated entries but not direct ones.
+1. **Cache probe.** The key covers the media fingerprint, the target language, the rejection set, and the translation model, so changing the model invalidates translated entries but not direct ones, and every rejection generation caches separately.
 2. **Parallel start.** Audio analysis and provider searches are launched together; the searches for the source language do not wait for the probe.
 3. **Source validation.** Candidates in the original language are aligned against the transcript (`alignSubtitleToTranscript`). The winner becomes the *trusted timing track*.
 4. **Target validation.** Candidates in the target language are aligned against that trusted track (`alignSubtitleToReference`). A match is served directly, with the lower of the two confidences.
 5. **Translation fallback.** If nothing matches, Gemini translates the trusted track's text. The model sees cue ids and text only.
 6. **Store.** Success is written to the cache; a cache write failure costs time on the next play but never fails the request.
+
+Each result carries a variant id — `provider:providerId`, or that id prefixed with `gemini:` for a translation — which is what a rejection records. Rejecting a translation bars its source track, because reusing that track would produce the same translation again. Audio probes are kept in memory per release, so a rejection-driven re-run skips ffmpeg entirely and finishes in seconds.
 
 Candidates are downloaded in waves of up to three, taking the best remaining entry from distinct providers, so a single provider's near-duplicate files cannot consume the whole budget (and, for OpenSubtitles, the account's download quota).
 
@@ -89,12 +99,13 @@ Everything that depends only on the inputs — sorted cue times, per-cue token s
 ```
 data/
 ├── streams.json          play-link registry (records + last selection per title)
+├── rejections.json       variant ids the viewer rejected, per release
 └── subtitles/
     ├── <key>.srt         finished subtitle
     └── <key>.json        provider, language, confidence, translated flag
 ```
 
-Both are written to a unique temporary file and renamed, so a crash cannot leave a half-written entry. Registry writes are serialized through a promise chain; cache writes carry a per-process random suffix. The registry prunes by TTL and record count; the cache is swept by age (`CACHE_TTL_DAYS`).
+All three are written to a unique temporary file and renamed, so a crash cannot leave a half-written entry. Registry writes are serialized through a promise chain; cache writes carry a per-process random suffix. The registry prunes by TTL and record count; the cache is swept by age (`CACHE_TTL_DAYS`).
 
 ## Failure policy
 
@@ -102,3 +113,4 @@ Both are written to a unique temporary file and renamed, so a crash cannot leave
 - A candidate that fails to download, unpack, decode or align is skipped; the next wave runs.
 - Anything below `MINIMUM_CONFIDENCE` is not served. The request fails instead.
 - Errors are mapped to statuses a client can act on: 404 expired job, 422 nothing matched, 504 still working, 502 upstream fault.
+- Because a player renders none of those to the viewer, the subtitle routes convert them into a readable message track unless `STATUS_MESSAGES=false`.

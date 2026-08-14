@@ -19,6 +19,7 @@ Stremio ──► AutoSub ──► your configured Torrentio/debrid addon
 
 ## Contents
 
+- [What you see while watching](#what-you-see-while-watching)
 - [How it works](#how-it-works)
 - [What travels where](#what-travels-where)
 - [Requirements](#requirements)
@@ -27,6 +28,24 @@ Stremio ──► AutoSub ──► your configured Torrentio/debrid addon
 - [Operating it](#operating-it)
 - [Development](#development)
 - [Documentation](#documentation)
+
+## What you see while watching
+
+Stremio gives an addon no way to show a spinner, so AutoSub reports itself through the two channels a player always renders: the subtitle menu and the subtitles themselves.
+
+| In the subtitle menu | Meaning |
+|---|---|
+| `Arabic` | The normal entry. Your preferred-language setting still auto-selects it. |
+| `AutoSub: preparing Arabic...` | Still searching and validating. Reopen the menu shortly. |
+| `AutoSub: found on opensubtitles (81%)` | A real subtitle was found and validated at that confidence. |
+| `AutoSub: AI translated from English (74%)` | Nothing matched directly, so the validated English timing was translated. |
+| `AutoSub: try another Arabic subtitle` | Select this if the subtitle is wrong. |
+
+While playing, the delivered subtitle opens with one short line naming its origin — `[AutoSub] opensubtitles subtitle - 81% match` — which disappears after a few seconds. If preparation is still running or nothing passed validation, you get a readable message on screen instead of silence.
+
+**"Try another" marks the current subtitle as bad**, remembers that permanently for this release, and prepares the next best candidate. The rejection survives restarts, so the same file is never handed back, and the audio analysis is reused, which makes a second attempt take seconds rather than another full run. Selecting it again moves to the one after that; when nothing is left, it says so.
+
+Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` or `STATUS_MESSAGES=false` to get the plain single-entry behaviour back.
 
 ## How it works
 
@@ -37,9 +56,9 @@ Stremio ──► AutoSub ──► your configured Torrentio/debrid addon
 5. **Candidate search.** OpenSubtitles, SubDL, and SubSource are searched concurrently and the results ranked by hash match, release-name similarity, source, group, edition, and frame rate.
 6. **Validation.** Candidates are downloaded in waves — the best entry from each provider at a time — and scored against the speech timeline. A global model corrects constant delay and constrained frame-rate drift (50 ms / 0.01% precision). Anything that only fits in places is rejected.
 7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. Otherwise Gemini translates the corrected source text under a fixed schema; timestamps never leave this process.
-8. **Caching.** The result is stored by release fingerprint and translation-engine version, so repeat plays are instant.
+8. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
 
-If nothing passes, AutoSub returns an error rather than a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
+If nothing passes, AutoSub says so rather than serving a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
 
 ## What travels where
 
@@ -110,6 +129,9 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `CANDIDATE_LIMIT` | `10` | Candidates downloaded and validated per language |
 | `JOB_WAIT_MS` | `120000` | How long a subtitle request waits for preparation |
 | `CACHE_TTL_DAYS` | `30` | Age at which cached subtitles are swept |
+| `MENU_ENTRIES` | `true` | Add status and "try another" entries to the subtitle menu |
+| `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
+| `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
 
 Invalid or out-of-range values are clamped rather than trusted, and the server prints a warning for each risky setting at startup (unset token, non-HTTPS public URL, missing upstream, disabled analysis).
 
@@ -122,7 +144,7 @@ docker compose build --pull && docker compose up -d   # update
 npm run smoke -- tt1234567                   # end-to-end check against a real title
 ```
 
-Each finished subtitle carries `X-AutoSub-Confidence` and `X-AutoSub-Provider` headers, and the logs record the chosen provider, language, confidence, offset and rate for every run. [docs/operations.md](docs/operations.md) covers failure modes, status codes and troubleshooting.
+Each finished subtitle carries `X-AutoSub-Confidence`, `X-AutoSub-Provider`, `X-AutoSub-Translated` and `X-AutoSub-Variant` headers, and the logs record the chosen provider, language, confidence, offset and rate for every run. [docs/operations.md](docs/operations.md) covers failure modes, status codes and troubleshooting.
 
 ## Development
 

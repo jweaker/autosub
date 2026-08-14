@@ -12,6 +12,7 @@
 | `GET /:token/play/:playId` | Records the release, starts preparation, 302s to the debrid URL |
 | `GET /:token/subtitles/:type/:id[/:extra].json` | Subtitle list for the release being played |
 | `GET /:token/file/:jobId.srt` | The finished subtitle |
+| `GET /:token/next/:jobId.srt` | Rejects the current subtitle and serves the next candidate |
 
 Anything with a wrong token returns 404, compared in constant time.
 
@@ -37,6 +38,8 @@ curl -fsS http://127.0.0.1:7000/healthz | jq
 A provider missing from `providers` has no API key configured. `translation: "disabled"` means no Gemini key, so a title with no direct target-language match will simply fail.
 
 ## Status codes
+
+With `STATUS_MESSAGES=true` (the default), the subtitle routes answer 200 with a readable message track instead of the error codes below, and set `X-AutoSub-State` to `preparing`, `failed`, `expired` or `exhausted`. The codes apply when that is turned off.
 
 | Code | Meaning | What to do |
 |---|---|---|
@@ -67,18 +70,26 @@ Direct ar subtitle selected from subdl; ...
 No direct ar timing match; translating trusted en timing with gemini-3.5-flash
 ```
 
+A viewer pressing "try another" logs the rejection and the follow-up attempt:
+
+```
+Rejected subdl:41283 for tt1234567 (ar); trying the next candidate
+Preparing ar for tt1234567 while skipping 1 rejected subtitle(s)
+```
+
 Warnings that are normal in small numbers: a provider search failing (the others continue), a candidate failing to download or parse (the next wave runs), `WebRTC VAD unavailable` (the energy fallback is in use — worth fixing, but not fatal).
 
 ## Data and housekeeping
 
 ```
 data/streams.json      play-link registry
+data/rejections.json   subtitles the viewer marked as wrong, per release
 data/subtitles/        cached results
 ```
 
-Both are safe to delete while the service is stopped: the registry rebuilds as titles are browsed, and the cache re-derives on the next play. Expired registry records and cached subtitles older than `CACHE_TTL_DAYS` are swept hourly and at startup.
+All three are safe to delete while the service is stopped: the registry rebuilds as titles are browsed, and the cache re-derives on the next play. Expired registry records and cached subtitles older than `CACHE_TTL_DAYS` are swept hourly and at startup.
 
-To force a re-run for one title, delete its `data/subtitles/<key>.*` pair — or simply bump `GEMINI_MODEL`, which invalidates translated entries by design.
+To force a re-run for one title, delete its `data/subtitles/<key>.*` pair — or simply bump `GEMINI_MODEL`, which invalidates translated entries by design. Deleting `data/rejections.json` gives every previously rejected subtitle another chance.
 
 ## Restarting and updating
 

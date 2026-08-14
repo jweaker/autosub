@@ -51,4 +51,6 @@ Change one thing at a time and re-test against several real releases. `npm run s
 
 **Everything is translated even though target-language subtitles exist.** They were downloaded and rejected: their cue events did not match the trusted track. That is often correct — different cut, different release. Lower `MINIMUM_CONFIDENCE` only after checking a few by hand.
 
+**A delivered subtitle is wrong even though it passed.** Pick "AutoSub: try another" in the subtitle menu. That records the file as rejected for this release forever and prepares the next best candidate, reusing the audio analysis. If it happens repeatedly on titles of the same kind, raise `MINIMUM_CONFIDENCE`; the rejections tell you where the current threshold is too generous.
+
 **Cold runs are slow.** Audio sampling dominates, and it is bounded by the debrid host's seek latency. Reduce `AUDIO_SAMPLE_SECONDS` or `AUDIO_SAMPLE_COUNT` before touching anything else; both weaken coverage, so watch for false matches afterwards.

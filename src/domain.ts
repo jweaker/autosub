@@ -69,11 +69,18 @@ export interface AlignmentResult {
 
 export interface CompletedSubtitle {
   key: string;
+  /**
+   * Identifies which candidate produced this file, so a viewer can reject it
+   * and ask for the next one. Direct matches use `provider:providerId`;
+   * translations prefix the source track's id with `gemini:`.
+   */
+  id: string;
   language: string;
   content: string;
   confidence: number;
   provider: string;
   translated: boolean;
+  sourceLanguage?: string;
 }
 
 export interface ReleaseSignature {

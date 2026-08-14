@@ -7,10 +7,12 @@ import type { AudioProbeResult, StreamRecord, SubtitleCandidate, SubtitleCue, Su
 // The analyzer shells out to ffmpeg and Deepgram, so the pipeline is exercised
 // against a recorded-looking probe instead of real media.
 const probe = vi.hoisted(() => ({ current: undefined as AudioProbeResult | undefined }));
+const analyses = vi.hoisted(() => ({ count: 0 }));
 vi.mock("../src/audio.js", () => ({
   AudioAnalyzer: class {
     async analyze(): Promise<AudioProbeResult> {
       if (!probe.current) throw new Error("no probe configured");
+      analyses.count += 1;
       return probe.current;
     }
   },
@@ -105,6 +107,7 @@ async function config(overrides: Record<string, string> = {}) {
 
 beforeEach(() => {
   probe.current = makeProbe(sourceCues, shiftMs, "en");
+  analyses.count = 0;
 });
 
 afterEach(() => vi.unstubAllGlobals());
@@ -165,6 +168,59 @@ describe("subtitle pipeline", () => {
       .map((cue, index) => ({ ...cue, text: `foreign${index} alpha${index} beta${index}` }));
     const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(unrelated) }]]));
     await expect(new AutoSubPipeline(await config({ MINIMUM_CONFIDENCE: "58" }), [provider]).complete(request, stream, "ar"))
+      .rejects.toThrow(/matched the transcribed audio/);
+  });
+
+  it("skips a rejected subtitle and returns a different one", async () => {
+    const arabic = (label: string) => serializeSrt(sourceCues.map((cue) => ({
+      ...cue,
+      startMs: cue.startMs - 2_500,
+      endMs: cue.endMs - 2_500,
+      text: `${label} ${cue.id}`,
+    })));
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: arabic("أول") }],
+      ["ar-2", { language: "ar", content: arabic("ثاني") }],
+    ]));
+    const pipeline = new AutoSubPipeline(await config(), [provider]);
+
+    const first = await pipeline.complete(request, stream, "ar");
+    const second = await pipeline.complete(request, stream, "ar", [first.id]);
+    expect(second.id).not.toBe(first.id);
+    expect(second.content).not.toContain(first.content.split("\n")[2]);
+  });
+
+  it("reuses the audio probe when preparing an alternative", async () => {
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `أ ${cue.id}` }))) }],
+      ["ar-2", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `ب ${cue.id}` }))) }],
+    ]));
+    const pipeline = new AutoSubPipeline(await config(), [provider]);
+    const first = await pipeline.complete(request, stream, "ar");
+    await pipeline.complete(request, stream, "ar", [first.id]);
+    // Re-sampling the release would cost another ffmpeg pass over the network.
+    expect(analyses.count).toBe(1);
+  });
+
+  it("keeps a rejected translation from being produced again", async () => {
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+    ]));
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { contents: Array<{ parts: Array<{ text: string }> }> };
+      const cues = JSON.parse(body.contents[0].parts[0].text.split("Cues: ")[1]) as Array<{ id: number }>;
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: JSON.stringify(cues.map((cue) => ({ id: cue.id, text: `مترجم ${cue.id}` }))) }] } }],
+      }), { status: 200 });
+    }));
+    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key" }), [provider]);
+
+    const translated = await pipeline.complete(request, stream, "ar");
+    expect(translated.id).toBe("gemini:fake:en-1");
+    // The only usable source track is barred, so there is nothing left to offer.
+    await expect(pipeline.complete(request, stream, "ar", [translated.id]))
       .rejects.toThrow(/matched the transcribed audio/);
   });
 

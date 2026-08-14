@@ -11,7 +11,9 @@ import { prepareSubtitle } from "./subtitle-content.js";
 import { GeminiTranslator } from "./translation.js";
 
 /** Cache key version; bump when a change should invalidate stored subtitles. */
-const CACHE_VERSION = 7;
+const CACHE_VERSION = 8;
+const PROBE_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_CACHED_PROBES = 12;
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 const CANDIDATES_PER_WAVE = 3;
 
@@ -40,6 +42,7 @@ export class AutoSubPipeline {
   private readonly translator: GeminiTranslator;
   private readonly cache: SubtitleCache;
   private readonly byName: Map<string, SubtitleProvider>;
+  private readonly probes = new Map<string, { probe: AudioProbeResult; at: number }>();
 
   constructor(
     private readonly config: AppConfig,
@@ -129,8 +132,14 @@ export class AutoSubPipeline {
   }
 
   /** Downloads and validates candidates in waves, stopping at the first confident match. */
-  private async evaluate(request: SubtitleRequest, candidates: SubtitleCandidate[], align: Aligner): Promise<Evaluated | undefined> {
-    const remaining = rankCandidates(request, candidates).slice(0, this.config.candidateLimit);
+  private async evaluate(
+    request: SubtitleRequest,
+    candidates: SubtitleCandidate[],
+    align: Aligner,
+    excluded: Set<string>,
+  ): Promise<Evaluated | undefined> {
+    const usable = candidates.filter((candidate) => !excluded.has(variantId(candidate)));
+    const remaining = rankCandidates(request, usable).slice(0, this.config.candidateLimit);
     const accepted: Evaluated[] = [];
     while (remaining.length) {
       const wave = this.nextWave(remaining);
@@ -145,17 +154,30 @@ export class AutoSubPipeline {
     return accepted.sort((left, right) => weight(right) - weight(left))[0];
   }
 
-  private cacheKey(request: SubtitleRequest, stream: StreamRecord, target: string): string {
+  private cacheKey(request: SubtitleRequest, stream: StreamRecord, target: string, excluded: string[]): string {
     return stableKey({
       version: CACHE_VERSION,
+      // Rejected variants are part of the identity of the answer: the same
+      // release asked again after a rejection is a different question.
+      excluded: [...excluded].sort(),
       type: request.type,
       id: request.contentId,
       hash: request.videoHash,
       size: request.videoSize,
       filename: request.filename,
-      streamFingerprint: request.videoHash || (request.filename ? `${request.filename}:${request.videoSize || ""}` : stableKey(stream.url)),
+      streamFingerprint: streamFingerprint(request, stream),
       target,
       geminiModel: this.config.gemini.model,
+    });
+  }
+
+  /** Fingerprint of the release itself, stable across rejections. */
+  releaseKey(request: SubtitleRequest, stream: StreamRecord, targetLanguage: string): string {
+    return stableKey({
+      type: request.type,
+      id: request.contentId,
+      streamFingerprint: streamFingerprint(request, stream),
+      target: normalizeLanguage(targetLanguage) || targetLanguage,
     });
   }
 
@@ -169,7 +191,17 @@ export class AutoSubPipeline {
     return result;
   }
 
-  async complete(originalRequest: SubtitleRequest, stream: StreamRecord, targetLanguage: string): Promise<CompletedSubtitle> {
+  /**
+   * @param excludeIds Variant ids the viewer already rejected. A rejected
+   * translation also bars its source track, because reusing that track would
+   * produce the same translation again.
+   */
+  async complete(
+    originalRequest: SubtitleRequest,
+    stream: StreamRecord,
+    targetLanguage: string,
+    excludeIds: string[] = [],
+  ): Promise<CompletedSubtitle> {
     const started = Date.now();
     const target = normalizeLanguage(targetLanguage) || targetLanguage;
     const request: SubtitleRequest = {
@@ -179,17 +211,19 @@ export class AutoSubPipeline {
       videoSize: originalRequest.videoSize || stream.videoSize,
       languages: [target],
     };
-    const key = this.cacheKey(request, stream, target);
+    const excluded = new Set(excludeIds.map((id) => (id.startsWith(TRANSLATED_PREFIX) ? id.slice(TRANSLATED_PREFIX.length) : id)));
+    const key = this.cacheKey(request, stream, target, excludeIds);
     const cached = await this.cache.get(key);
     if (cached) return cached;
     if (!this.config.audioAnalysisEnabled) throw new Error("Audio analysis is disabled; refusing to guess a subtitle");
+    if (excludeIds.length) console.log(`Preparing ${target} for ${request.contentId} while skipping ${excludeIds.length} rejected subtitle(s)`);
 
     const metadataLanguage = await this.metadata.originalLanguage(request.imdbId, request.type);
     const initialSourceLanguages = normalizedSet([metadataLanguage, ...this.config.referenceLanguages]);
 
     // Audio analysis and the provider searches are independent; overlapping
     // them removes several seconds from every cold start.
-    const analysisPromise = this.audio.analyze(stream, metadataLanguage);
+    const analysisPromise = this.analyze(stream, metadataLanguage);
     const initialSourcePromise = this.search(request, initialSourceLanguages);
     const targetPromise = initialSourceLanguages.includes(target)
       ? initialSourcePromise
@@ -210,6 +244,7 @@ export class AutoSubPipeline {
       request,
       [...initialSource, ...additionalSource],
       (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
+      excluded,
     );
     if (!source) throw new Error(`No subtitle in ${sourceLanguages.join(", ")} matched the transcribed audio`);
     log("Trusted timing", source, probe, started);
@@ -217,6 +252,7 @@ export class AutoSubPipeline {
     if (sourceLanguages.includes(target)) {
       return this.store({
         key,
+        id: variantId(source.ranked.candidate),
         language: target,
         content: source.content,
         confidence: source.confidence,
@@ -230,11 +266,13 @@ export class AutoSubPipeline {
       request,
       targetCandidates,
       (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
+      excluded,
     );
     if (direct) {
       log(`Direct ${target} subtitle`, direct, probe, started);
       return this.store({
         key,
+        id: variantId(direct.ranked.candidate),
         language: target,
         content: direct.content,
         confidence: Math.min(source.confidence, direct.confidence),
@@ -248,13 +286,44 @@ export class AutoSubPipeline {
     const translated = await this.translator.translate(referenceCues, sourceLanguage, target);
     return this.store({
       key,
+      id: `${TRANSLATED_PREFIX}${variantId(source.ranked.candidate)}`,
       language: target,
       content: serializeSrt(translated),
       confidence: source.confidence,
       provider: `${source.ranked.candidate.provider}+gemini`,
       translated: true,
+      sourceLanguage,
     });
   }
+
+  /**
+   * Audio analysis is by far the slowest step, and "try another" asks the same
+   * questions of the same audio, so a probe is kept in memory for the release.
+   * Reusing the object also reuses the aligner's per-window precomputation.
+   */
+  private async analyze(stream: StreamRecord, metadataLanguage: string | undefined): Promise<AudioProbeResult> {
+    const key = stream.videoHash || stream.url;
+    const cached = this.probes.get(key);
+    if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.probe;
+    const probe = await this.audio.analyze(stream, metadataLanguage);
+    this.probes.set(key, { probe, at: Date.now() });
+    while (this.probes.size > MAX_CACHED_PROBES) {
+      const oldest = this.probes.keys().next();
+      if (oldest.done) break;
+      this.probes.delete(oldest.value);
+    }
+    return probe;
+  }
+}
+
+const TRANSLATED_PREFIX = "gemini:";
+
+function variantId(candidate: SubtitleCandidate): string {
+  return `${candidate.provider}:${candidate.providerId}`;
+}
+
+function streamFingerprint(request: SubtitleRequest, stream: StreamRecord): string {
+  return request.videoHash || (request.filename ? `${request.filename}:${request.videoSize || ""}` : stableKey(stream.url));
 }
 
 function normalizedSet(values: Array<string | undefined>): string[] {

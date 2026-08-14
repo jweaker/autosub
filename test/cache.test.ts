@@ -7,6 +7,7 @@ import type { CompletedSubtitle } from "../src/domain.js";
 
 const entry = (key: string): CompletedSubtitle => ({
   key,
+  id: "opensubtitles:1",
   language: "ar",
   content: "1\n00:00:01,000 --> 00:00:02,000\nمرحبا\n",
   confidence: 71,
