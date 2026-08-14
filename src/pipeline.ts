@@ -211,17 +211,20 @@ export class AutoSubPipeline {
     sourceLanguages: string[],
     target: string,
     mark: <T>(stage: string, work: Promise<T>) => Promise<T>,
+    referenceWasTrusted: boolean,
   ): Promise<{ subtitle: Omit<CompletedSubtitle, "key">; evaluated: Evaluated; route: "reference" | "audio" } | undefined> {
     const maxOffsetMs = this.config.maxSyncOffsetSeconds * 1000;
     const byActivity: Aligner = (cues) => alignSubtitle(cues, probe.windows, maxOffsetMs);
     const bar = this.config.activityMinimumConfidence;
 
+    let trusted = referenceWasTrusted;
     const languages = this.config.fallbackReferenceLanguages
       .filter((language) => language !== target && !sourceLanguages.includes(language));
     if (languages.length) {
       const candidates = await mark("searchFallback", this.search(request, languages));
       const reference = await mark("validateFallbackReference", this.evaluate(request, candidates, byActivity, excluded, bar));
       if (reference) {
+        trusted = true;
         console.log(`Using a ${normalizeLanguage(reference.ranked.candidate.language) || languages[0]} subtitle as the timing reference (confidence=${reference.confidence})`);
         const referenceCues = parseSrt(reference.content);
         const matched = await mark("validateTargetFallback", this.evaluate(
@@ -247,6 +250,15 @@ export class AutoSubPipeline {
       }
     }
 
+    // Speech activity is the weakest evidence there is: a dense subtitle can
+    // drape itself over four windows of speech blobs in many ways. When a
+    // timing track was trusted and these same candidates failed against it,
+    // that is a stronger answer already given, and re-asking a weaker witness
+    // until one agrees is how a subtitle nobody vouched for gets served.
+    if (trusted) {
+      console.log(`Not falling back to speech activity for ${target}: a trusted timing track already rejected these candidates`);
+      return undefined;
+    }
     const direct = await mark("validateTargetAudio", this.evaluate(request, targetCandidates, byActivity, excluded, bar));
     if (!direct) return undefined;
     console.log(`Accepted a ${target} subtitle on speech activity alone (confidence=${direct.confidence})`);
@@ -477,7 +489,7 @@ export class AutoSubPipeline {
     // be checked against speech activity and then vouch for the target — which
     // is what matters for a film whose original language has a handful of
     // subtitles but whose English catalogue has hundreds.
-    const fallback = await this.matchWithoutSpokenSource(request, probe, targetCandidates, excluded, sourceLanguages, target, mark);
+    const fallback = await this.matchWithoutSpokenSource(request, probe, targetCandidates, excluded, sourceLanguages, target, mark, rejectedSources.size > excluded.size);
     if (fallback) {
       const result = await this.store({ key, ...fallback.subtitle });
       log(`Fallback ${target} subtitle`, fallback.evaluated, probe, started, stages);

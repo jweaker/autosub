@@ -28,6 +28,10 @@ interface MappingScore {
  * So a rate deviation is charged against the score it earns. A genuine
  * conversion pays the toll easily, because at the wrong rate a subtitle is
  * seconds out by the far end of the film. A guess does not.
+ *
+ * The charge is a fraction of the best score rather than a fixed amount,
+ * because the three matchers score on different scales and a flat toll would
+ * be pocket change to one and prohibitive to another.
  */
 const RATE_PENALTY = 3;
 
@@ -259,10 +263,14 @@ interface Placement {
  * the largest negative offset at the lowest rate in the list.
  */
 function select(placements: Placement[], penalty: number): Placement | undefined {
+  let bestScore = 0;
+  for (const placement of placements) if (placement.score > bestScore) bestScore = placement.score;
+  const toll = penalty * bestScore;
+
   let chosen: Placement | undefined;
   let chosenScore = Number.NEGATIVE_INFINITY;
   for (const placement of placements) {
-    const score = placement.score - (penalty * Math.abs(placement.rate - 1));
+    const score = placement.score - (toll * Math.abs(placement.rate - 1));
     if (score > chosenScore || (score === chosenScore && chosen && Math.abs(placement.offsetMs) < Math.abs(chosen.offsetMs))) {
       chosen = placement;
       chosenScore = score;

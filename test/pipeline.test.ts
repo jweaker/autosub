@@ -218,6 +218,21 @@ describe("subtitle pipeline", () => {
     expect(pipeline.recentRuns()[0].route).toBe("audio");
   });
 
+  it("does not let speech activity overrule a timing track that said no", async () => {
+    // The English source validates against the transcript, and the Arabic
+    // candidate does not match it. Asking a weaker witness until one agrees is
+    // how a subtitle nobody vouched for reaches the screen.
+    const unrelated = makeCues(90, 900_000, "unrelated")
+      .map((cue, index) => ({ ...cue, text: `مختلف${index}` }));
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(unrelated) }],
+    ]));
+
+    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "k" }), [provider]);
+    await expect(pipeline.complete(request, stream, "ar")).rejects.toBeInstanceOf(TranslationRequiredError);
+  });
+
   it("holds activity-only matches to a higher bar", async () => {
     probe.current = makeProbe(sourceCues, shiftMs, "ja");
     const arabic = sourceCues.map((cue) => ({ ...cue, text: `عربي ${cue.id}` }));

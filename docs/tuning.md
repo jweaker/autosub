@@ -85,6 +85,8 @@ Change one thing at a time and re-test against several real releases. `npm run s
 
 **Nothing is ever returned for a title.** Look at the log line from the audio analysis. Few or zero transcripts usually means an unusual audio codec, a mislabelled track, or no Deepgram key.
 
+**A title falls back to `audio`.** That route only runs when no timing track in any language could be trusted, because speech activity cannot overrule a rejection by stronger evidence. Seeing it means the title had no usable reference at all.
+
 **Everything about a title goes through the fallback route.** Check `route` in `/stats`: `source` means a subtitle in the spoken language carried the timing, `reference` means another language did, `audio` means the target was matched against speech activity alone. A film whose original language has few subtitles — anime, most non-English cinema — will legitimately sit on `reference`. If it sits on `audio` often, add languages to `FALLBACK_REFERENCE_LANGUAGES`, because a whole-title event match is much stronger evidence than four sampled windows.
 
 **Everything is translated even though target-language subtitles exist.** They were downloaded and rejected: their cue events did not match the trusted track. That is often correct — different cut, different release. Lower `MINIMUM_CONFIDENCE` only after checking a few by hand.
