@@ -560,11 +560,18 @@ export class AutoSubPipeline {
     }
     console.log(`No direct ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.translator.name} (${this.config.translation.model})`);
     const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
+    // A translation carries the timing of the track it was translated from, so
+    // it answers to the audio like everything else.
+    const settledTranslation = this.settleOnSpeech(serializeSrt(translated), probe, "the translation");
+    if (!settledTranslation) {
+      summary("failed");
+      throw new Error(`The ${sourceLanguage} timing track does not match the audio closely enough to translate from`);
+    }
     const result = await this.store({
       key,
       id: `${TRANSLATED_PREFIX}${variantId(source.ranked.candidate)}`,
       language: target,
-      content: serializeSrt(translated),
+      content: settledTranslation,
       confidence: source.confidence,
       provider: `${source.ranked.candidate.provider}+${this.translator.name}`,
       translated: true,
