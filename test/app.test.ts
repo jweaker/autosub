@@ -8,7 +8,7 @@ import { createApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import type { CompletedSubtitle, StreamRecord, SubtitleRequest } from "../src/domain.js";
 import { JobManager } from "../src/jobs.js";
-import type { AutoSubPipeline } from "../src/pipeline.js";
+import { type AutoSubPipeline, TranslationRequiredError } from "../src/pipeline.js";
 import { RejectionStore } from "../src/rejections.js";
 import { StreamRegistry, UpstreamStreamAddon } from "../src/streams.js";
 
@@ -214,6 +214,35 @@ describe("addon HTTP surface", () => {
     expect((await fetch(local(entries[0].url))).headers.get("x-autosub-variant")).toBe("subdl:2");
     const relisted = await listSubtitles();
     expect(relisted[1].lang).toContain("found on subdl");
+  });
+
+  it("offers an AI translation instead of buying one unasked", async () => {
+    const complete = vi.fn(async (_request, _stream, _language, _exclude: string[] = [], translate = false) => {
+      if (!translate) throw new TranslationRequiredError("Arabic");
+      return subtitle({ translated: true, provider: "opensubtitles+gemini", sourceLanguage: "en", id: "gemini:opensubtitles:1" });
+    });
+    await start(complete as unknown as AutoSubPipeline["complete"], { GEMINI_API_KEY: "k" });
+    await playStream();
+    const entries = await listSubtitles();
+
+    const offer = entries.find((entry) => entry.url.includes("/translate/"));
+    expect(offer?.lang).toBe("Arabic - AI translate, uses credits (AutoSub)");
+
+    // The plain row explains the situation rather than silently spending.
+    const plain = await fetch(local(entries[0].url));
+    expect(plain.headers.get("x-autosub-state")).toBe("translation-offered");
+    expect(await plain.text()).toContain("AI translate");
+    expect(complete).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), true);
+
+    // Choosing it is what authorises the spend.
+    const translated = await fetch(local(offer?.url as string));
+    expect(translated.headers.get("x-autosub-translated")).toBe("true");
+  });
+
+  it("hides the translation row when no model is configured", async () => {
+    await start(async () => subtitle());
+    await playStream();
+    expect((await listSubtitles()).some((entry) => entry.url.includes("/translate/"))).toBe(false);
   });
 
   it("explains when there is nothing else to try", async () => {

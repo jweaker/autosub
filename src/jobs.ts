@@ -68,9 +68,11 @@ export class JobManager {
     return count;
   }
 
-  start(request: SubtitleRequest, stream: StreamRecord, language: string, exclude: string[] = []): string {
+  start(request: SubtitleRequest, stream: StreamRecord, language: string, exclude: string[] = [], translate = false): string {
     const releaseKey = this.pipeline.releaseKey(request, stream, language);
-    const key = `${releaseKey}:${[...exclude].sort().join(",")}`;
+    // A translation request is a different question from the same release, so
+    // it gets its own job rather than reusing the one that already gave up.
+    const key = `${releaseKey}:${[...exclude].sort().join(",")}${translate ? ":translate" : ""}`;
     const existing = this.byKey.get(key);
     if (existing && this.jobs.has(existing)) return existing;
 
@@ -82,7 +84,7 @@ export class JobManager {
       request,
       stream,
       language,
-      promise: this.pipeline.complete(request, stream, language, exclude),
+      promise: this.pipeline.complete(request, stream, language, exclude, translate),
       createdAt: Date.now(),
       state: "preparing",
     };
@@ -108,10 +110,21 @@ export class JobManager {
   }
 
   /** Starts a job that already skips everything the viewer rejected before. */
-  async startTracked(request: SubtitleRequest, stream: StreamRecord, language: string): Promise<string> {
+  async startTracked(request: SubtitleRequest, stream: StreamRecord, language: string, translate = false): Promise<string> {
     const releaseKey = this.pipeline.releaseKey(request, stream, language);
     const exclude = this.rejections ? await this.rejections.list(releaseKey) : [];
-    return this.start(request, stream, language, exclude);
+    return this.start(request, stream, language, exclude, translate);
+  }
+
+  /**
+   * Prepares an AI translation for the release a job belongs to, which the
+   * viewer has to ask for explicitly when translation is not automatic.
+   */
+  async translate(id: string, timeoutMs: number): Promise<CompletedSubtitle> {
+    const job = this.current(id);
+    if (!job) throw new JobExpiredError();
+    const translationId = await this.startTracked(job.request, job.stream, job.language, true);
+    return this.result(translationId, timeoutMs);
   }
 
   /** Target language of a job, used to phrase status messages. */

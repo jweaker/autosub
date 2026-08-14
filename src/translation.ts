@@ -10,6 +10,12 @@ interface TranslationRow {
 
 interface GeminiResponse {
   candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+}
+
+export interface TranslationUsage {
+  promptTokens: number;
+  responseTokens: number;
 }
 
 const MAX_CUES_PER_BATCH = 120;
@@ -25,6 +31,10 @@ const SCHEMA_ATTEMPTS = 2;
  * the timing that was validated against the audio.
  */
 export class GeminiTranslator {
+  /** Token counts from the most recent translate() call, for cost reporting. */
+  lastUsage?: TranslationUsage;
+  private usage: TranslationUsage = { promptTokens: 0, responseTokens: 0 };
+
   constructor(private readonly config: AppConfig["gemini"]) {}
 
   get enabled(): boolean {
@@ -91,6 +101,8 @@ export class GeminiTranslator {
           }),
         });
 
+        this.usage.promptTokens += body.usageMetadata?.promptTokenCount || 0;
+        this.usage.responseTokens += body.usageMetadata?.candidatesTokenCount || 0;
         const text = body.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
         const rows = JSON.parse(text) as TranslationRow[];
         const expected = new Set(batch.map((cue) => cue.id));
@@ -111,6 +123,7 @@ export class GeminiTranslator {
 
   async translate(cues: SubtitleCue[], source: string, target: string, signal?: AbortSignal): Promise<SubtitleCue[]> {
     if (!this.enabled) throw new Error("No Gemini API key is configured for subtitle translation");
+    this.usage = { promptTokens: 0, responseTokens: 0 };
     const batches = this.batches(cues);
     const translated = new Map<number, string>();
     // A small number of workers cuts fallback latency substantially while
@@ -123,6 +136,7 @@ export class GeminiTranslator {
       }
     };
     await Promise.all(Array.from({ length: Math.min(this.config.concurrency, batches.length) }, worker));
+    this.lastUsage = { ...this.usage };
     return cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
   }
 }

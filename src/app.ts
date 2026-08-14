@@ -16,9 +16,11 @@ import {
   preparingTrack,
   resultLabel,
   retryLabel,
+  translateLabel,
+  translationOfferTrack,
   withBanner,
 } from "./status.js";
-import type { AutoSubPipeline } from "./pipeline.js";
+import { type AutoSubPipeline, TranslationRequiredError } from "./pipeline.js";
 import type { StreamRegistry, UpstreamStreamAddon } from "./streams.js";
 
 export interface AppDependencies {
@@ -42,7 +44,7 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.5.0",
+  version: "1.6.0",
   name: "AutoSub",
   description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback",
   resources: [
@@ -60,6 +62,7 @@ function statusFor(error: unknown): number {
   if (error instanceof JobExpiredError) return 404;
   if (error instanceof JobTimeoutError) return 504;
   if (error instanceof HttpError) return error.status === 429 ? 429 : 502;
+  if (error instanceof TranslationRequiredError) return 422;
   if (error instanceof Error && /No subtitle|Could not determine|no audio stream|Not enough audio/i.test(error.message)) return 422;
   return 502;
 }
@@ -238,6 +241,15 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
         lang: retryLabel(language, attempt),
       });
     }
+    // Translation costs money per title, so in manual mode it is an explicit
+    // choice rather than something that happens on the viewer's behalf.
+    if (config.translationMode === "manual" && config.gemini.apiKey) {
+      entries.push({
+        id: `autosub-translate-${jobId}`,
+        url: fileUrl(`translate/${jobId}.srt`),
+        lang: translateLabel(language),
+      });
+    }
     return entries;
   }
 
@@ -281,6 +293,10 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
         "[AutoSub] This subtitle link is no longer active.",
         "Stop and reopen the title to prepare it again.",
       ]), "expired");
+      return;
+    }
+    if (error instanceof TranslationRequiredError) {
+      sendNotice(response, translationOfferTrack(language), "translation-offered");
       return;
     }
     const reason = error instanceof Error ? error.message : "Unknown error";
@@ -340,6 +356,16 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       respondToFailure(response, next, error, jobId);
     }
   }
+
+  // Explicitly asking for an AI translation of the trusted timing track.
+  app.get("/:token/translate/:jobId.srt", authorized, async (request, response, next) => {
+    const jobId = String(request.params.jobId);
+    try {
+      sendSubtitle(response, await jobs.translate(jobId, config.jobWaitMs));
+    } catch (error) {
+      respondToFailure(response, next, error, jobId);
+    }
+  });
 
   app.get("/:token/next/:jobId.srt", authorized, (request, response, next) => {
     void serveNext(request, response, next);

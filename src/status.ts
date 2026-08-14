@@ -36,6 +36,17 @@ export function retryLabel(language: string, attempt = 1): string {
   return `${languageName(language)} - try another${attempt > 1 ? ` #${attempt}` : ""} (AutoSub)`;
 }
 
+export function translateLabel(language: string): string {
+  return `${languageName(language)} - AI translate, uses credits (AutoSub)`;
+}
+
+export function translationOfferTrack(language: string): string {
+  return noticeTrack([
+    `[AutoSub] No ${languageName(language)} subtitle matched this release.`,
+    `Pick "${translateLabel(language)}" in the subtitle menu to have one translated.`,
+  ]);
+}
+
 /** One-line summary of what was delivered, shown briefly at the start of playback. */
 export function bannerText(result: CompletedSubtitle): string {
   const origin = result.translated

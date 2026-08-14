@@ -18,7 +18,7 @@ vi.mock("../src/audio.js", () => ({
   },
 }));
 
-const { AutoSubPipeline } = await import("../src/pipeline.js");
+const { AutoSubPipeline, TranslationRequiredError } = await import("../src/pipeline.js");
 const { loadConfig } = await import("../src/config.js");
 const { serializeSrt } = await import("../src/srt.js");
 
@@ -154,12 +154,71 @@ describe("subtitle pipeline", () => {
       }), { status: 200 });
     }));
 
-    const result = await new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key" }), [provider]).complete(request, stream, "ar");
+    const result = await new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key", TRANSLATION_MODE: "auto" }), [provider]).complete(request, stream, "ar");
     expect(result.translated).toBe(true);
     expect(result.provider).toBe("fake+gemini");
     expect(result.content).toContain("مترجم");
     // Timing comes from the validated source, never from the model.
     expect(result.content).toContain("-->");
+  });
+
+  it("tries another source track when the target cannot align to the first", async () => {
+    // A source can match the audio and still be a useless reference: cut for a
+    // different edit, or padded with stray cues. Committing to the first one
+    // used to send an otherwise perfect target subtitle to the translator.
+    const unusableSource = makeCues(90, 0, "spoken").map((cue, index) => ({
+      ...cue,
+      startMs: cue.startMs + index * 900,
+      endMs: cue.endMs + index * 900,
+    }));
+    const arabic = sourceCues.map((cue) => ({ ...cue, text: `عربي ${cue.id}` }));
+    const provider = new FakeProvider("fake", new Map([
+      // Ranked first by release-name similarity, but its events match nothing.
+      ["en-bad", { language: "en", content: serializeSrt(unusableSource) }],
+      ["en-good", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(arabic) }],
+    ]));
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("translation must not be reached");
+    }));
+
+    const result = await new AutoSubPipeline(await config({ GEMINI_API_KEY: "k" }), [provider]).complete(request, stream, "ar");
+    expect(result.translated).toBe(false);
+    expect(result.content).toContain("عربي");
+  });
+
+  it("does not translate unless the viewer asks", async () => {
+    const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(sourceCues) }]]));
+    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key" }), [provider]);
+    await expect(pipeline.complete(request, stream, "ar")).rejects.toBeInstanceOf(TranslationRequiredError);
+  });
+
+  it("translates on request and reports what it cost", async () => {
+    const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(sourceCues) }]]));
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { contents: Array<{ parts: Array<{ text: string }> }> };
+      const cues = JSON.parse(body.contents[0].parts[0].text.split("Cues: ")[1]) as Array<{ id: number }>;
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: JSON.stringify(cues.map((cue) => ({ id: cue.id, text: `مترجم ${cue.id}` }))) }] } }],
+        usageMetadata: { promptTokenCount: 1_000, candidatesTokenCount: 900 },
+      }), { status: 200 });
+    }));
+
+    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key" }), [provider]);
+    const result = await pipeline.complete(request, stream, "ar", [], true);
+    expect(result.translated).toBe(true);
+
+    const [run] = pipeline.recentRuns();
+    expect(run.outcome).toBe("translated");
+    expect(run.translation?.cues).toBe(sourceCues.length);
+    expect(run.translation?.promptTokens).toBeGreaterThan(0);
+    expect(run.translation?.responseTokens).toBeGreaterThan(0);
+  });
+
+  it("never translates when translation is switched off", async () => {
+    const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(sourceCues) }]]));
+    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "k", TRANSLATION_MODE: "off" }), [provider]);
+    await expect(pipeline.complete(request, stream, "ar", [], true)).rejects.toBeInstanceOf(TranslationRequiredError);
   });
 
   it("refuses to guess when nothing matches the audio", async () => {
@@ -215,7 +274,7 @@ describe("subtitle pipeline", () => {
         candidates: [{ content: { parts: [{ text: JSON.stringify(cues.map((cue) => ({ id: cue.id, text: `مترجم ${cue.id}` }))) }] } }],
       }), { status: 200 });
     }));
-    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key" }), [provider]);
+    const pipeline = new AutoSubPipeline(await config({ GEMINI_API_KEY: "test-key", TRANSLATION_MODE: "auto" }), [provider]);
 
     const translated = await pipeline.complete(request, stream, "ar");
     expect(translated.id).toBe("gemini:fake:en-1");
@@ -244,6 +303,20 @@ describe("subtitle pipeline", () => {
     ]));
     await new AutoSubPipeline(await config(), [provider]).complete(request, stream, "ar");
     expect(provider.downloads).toBe(2);
+  });
+
+  it("keeps run history across a restart", async () => {
+    const provider = new FakeProvider("fake", new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["ar-1", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `أ ${cue.id}` }))) }],
+    ]));
+    const settings = await config();
+    await new AutoSubPipeline(settings, [provider]).complete(request, stream, "ar");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // A fresh process must still be able to explain what happened before it.
+    const restarted = new AutoSubPipeline(settings, [provider]);
+    expect(restarted.recentRuns()[0]?.contentId).toBe("tt1");
   });
 
   it("records what each run cost", async () => {

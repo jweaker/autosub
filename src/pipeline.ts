@@ -1,9 +1,12 @@
+import { readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { alignSubtitleToReference, alignSubtitleToTranscript } from "./alignment.js";
 import { AudioAnalyzer } from "./audio.js";
 import { stableKey, SubtitleCache } from "./cache.js";
 import type { AppConfig } from "./config.js";
 import type { AudioProbeResult, CompletedSubtitle, RankedCandidate, StreamRecord, SubtitleCandidate, SubtitleCue, SubtitleProvider, SubtitleRequest } from "./domain.js";
-import { normalizeLanguage } from "./languages.js";
+import { languageName, normalizeLanguage } from "./languages.js";
 import { MetadataService } from "./metadata.js";
 import { rankCandidates } from "./ranking.js";
 import { parseSrt, serializeSrt } from "./srt.js";
@@ -16,6 +19,7 @@ const PROBE_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_CACHED_PROBES = 12;
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 const CANDIDATES_PER_WAVE = 3;
+const MAX_SOURCE_ATTEMPTS = 3;
 const DOWNLOAD_REUSE_MS = 60_000;
 const MAX_TRACKED_RUNS = 25;
 
@@ -29,6 +33,16 @@ export interface RunSummary {
   release?: string;
   totalMs: number;
   stages: Record<string, number>;
+  /** Present only for translated runs, so their cost is visible in /stats. */
+  translation?: { cues: number; characters: number; promptTokens?: number; responseTokens?: number };
+}
+
+/** Raised instead of translating when the viewer has not asked to pay for it. */
+export class TranslationRequiredError extends Error {
+  constructor(readonly language: string) {
+    super(`No ${language} subtitle matched this release; an AI translation was not requested`);
+    this.name = "TranslationRequiredError";
+  }
 }
 
 interface Evaluated {
@@ -59,6 +73,8 @@ export class AutoSubPipeline {
   private readonly downloads = new Map<string, Promise<Uint8Array>>();
   private readonly probes = new Map<string, { probe: Promise<AudioProbeResult>; at: number }>();
   private readonly runs: RunSummary[] = [];
+  private readonly runsPath: string;
+  private writingRuns = Promise.resolve();
 
   constructor(
     private readonly config: AppConfig,
@@ -70,6 +86,8 @@ export class AutoSubPipeline {
     this.translator = new GeminiTranslator(config.gemini);
     this.cache = cache;
     this.byName = new Map(providers.map((provider) => [provider.name, provider]));
+    this.runsPath = join(config.dataDir, "runs.json");
+    this.loadRuns();
   }
 
   /** Searches every provider at once; a provider that fails is logged, not fatal. */
@@ -250,6 +268,7 @@ export class AutoSubPipeline {
     stream: StreamRecord,
     targetLanguage: string,
     excludeIds: string[] = [],
+    translationRequested = false,
   ): Promise<CompletedSubtitle> {
     const started = Date.now();
     const target = normalizeLanguage(targetLanguage) || targetLanguage;
@@ -269,7 +288,7 @@ export class AutoSubPipeline {
         stages[stage] = Date.now() - from;
       });
     };
-    const summary = (outcome: RunSummary["outcome"], result?: CompletedSubtitle): void => this.record({
+    const summary = (outcome: RunSummary["outcome"], result?: CompletedSubtitle, translation?: RunSummary["translation"]): void => this.record({
       at: new Date().toISOString(),
       contentId: request.contentId,
       language: target,
@@ -279,6 +298,7 @@ export class AutoSubPipeline {
       release: request.filename,
       totalMs: Date.now() - started,
       stages,
+      translation,
     });
 
     const cached = await this.cache.get(key);
@@ -310,60 +330,93 @@ export class AutoSubPipeline {
       this.search(request, missing),
       targetPromise,
     ]);
+    const sourceCandidates = [...initialSource, ...additionalSource];
 
     // The target files are needed next in almost every run; fetching them now
     // overlaps their transfer with validating the source track.
     if (!sourceLanguages.includes(target)) this.prefetch(request, targetCandidates, excluded);
 
-    const source = await mark("validateSource", this.evaluate(
-      request,
-      [...initialSource, ...additionalSource],
-      (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
-      excluded,
-    ));
-    if (!source) {
-      summary("failed");
-      throw new Error(`No subtitle in ${sourceLanguages.join(", ")} matched the transcribed audio`);
-    }
-    log("Trusted timing", source, probe, started, stages);
+    // A source track can match the audio and still be useless as a timing
+    // reference — it may be cut for a different edit, or padded with stray cues
+    // that put its events nowhere near the target's. So a source that no target
+    // can align to is discarded and the next best one tried, rather than
+    // treating one bad reference as proof that no target subtitle fits.
+    const rejectedSources = new Set(excluded);
+    let source: Evaluated | undefined;
+    let attempt = 0;
+    for (; attempt < MAX_SOURCE_ATTEMPTS; attempt += 1) {
+      source = await mark(`validateSource${attempt || ""}`, this.evaluate(
+        request,
+        sourceCandidates,
+        (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
+        rejectedSources,
+      ));
+      if (!source) break;
+      log("Trusted timing", source, probe, started, stages);
 
-    if (sourceLanguages.includes(target)) {
-      const result = await this.store({
-        key,
-        id: variantId(source.ranked.candidate),
-        language: target,
-        content: source.content,
-        confidence: source.confidence,
-        provider: source.ranked.candidate.provider,
-        translated: false,
-      });
-      summary("direct", result);
-      return result;
+      if (sourceLanguages.includes(target)) {
+        const result = await this.store({
+          key,
+          id: variantId(source.ranked.candidate),
+          language: target,
+          content: source.content,
+          confidence: source.confidence,
+          provider: source.ranked.candidate.provider,
+          translated: false,
+        });
+        summary("direct", result);
+        return result;
+      }
+
+      const referenceCues = parseSrt(source.content);
+      const direct = await mark(`validateTarget${attempt || ""}`, this.evaluate(
+        request,
+        targetCandidates,
+        (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
+        excluded,
+      ));
+      if (direct) {
+        log(`Direct ${target} subtitle`, direct, probe, started, stages);
+        const result = await this.store({
+          key,
+          id: variantId(direct.ranked.candidate),
+          language: target,
+          content: direct.content,
+          confidence: Math.min(source.confidence, direct.confidence),
+          provider: direct.ranked.candidate.provider,
+          translated: false,
+        });
+        summary("direct", result);
+        return result;
+      }
+
+      console.warn(`No ${target} subtitle matched the ${source.ranked.candidate.provider}:${source.ranked.candidate.providerId} timing track; trying another source`);
+      rejectedSources.add(variantId(source.ranked.candidate));
+      source = undefined;
+    }
+
+    if (!source) {
+      const firstSource = await this.evaluate(
+        request,
+        sourceCandidates,
+        (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
+        excluded,
+      );
+      if (!firstSource) {
+        summary("failed");
+        throw new Error(`No subtitle in ${sourceLanguages.join(", ")} matched the transcribed audio`);
+      }
+      source = firstSource;
     }
 
     const referenceCues = parseSrt(source.content);
-    const direct = await mark("validateTarget", this.evaluate(
-      request,
-      targetCandidates,
-      (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
-      excluded,
-    ));
-    if (direct) {
-      log(`Direct ${target} subtitle`, direct, probe, started, stages);
-      const result = await this.store({
-        key,
-        id: variantId(direct.ranked.candidate),
-        language: target,
-        content: direct.content,
-        confidence: Math.min(source.confidence, direct.confidence),
-        provider: direct.ranked.candidate.provider,
-        translated: false,
-      });
-      summary("direct", result);
-      return result;
-    }
-
     const sourceLanguage = normalizeLanguage(source.ranked.candidate.language) || sourceLanguages[0];
+    // Translation is the only step that costs money per title, so unless the
+    // operator asked for it to happen by itself, the viewer decides.
+    if (this.config.translationMode === "off" || (this.config.translationMode === "manual" && !translationRequested)) {
+      summary("failed");
+      throw new TranslationRequiredError(languageName(target));
+    }
     console.log(`No direct ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.config.gemini.model}`);
     const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
     const result = await this.store({
@@ -376,7 +429,14 @@ export class AutoSubPipeline {
       translated: true,
       sourceLanguage,
     });
-    summary("translated", result);
+    const usage = this.translator.lastUsage;
+    summary("translated", result, {
+      cues: referenceCues.length,
+      characters: referenceCues.reduce((total, cue) => total + cue.text.length, 0),
+      promptTokens: usage?.promptTokens,
+      responseTokens: usage?.responseTokens,
+    });
+    console.log(`Translated ${referenceCues.length} cues to ${target}; tokens in=${usage?.promptTokens ?? "?"} out=${usage?.responseTokens ?? "?"}`);
     return result;
   }
 
@@ -410,6 +470,20 @@ export class AutoSubPipeline {
   private record(summary: RunSummary): void {
     this.runs.push(summary);
     if (this.runs.length > MAX_TRACKED_RUNS) this.runs.shift();
+    // Kept on disk because the runs worth explaining are usually the ones
+    // followed by a restart.
+    this.writingRuns = this.writingRuns
+      .then(() => writeFile(this.runsPath, JSON.stringify(this.runs), { encoding: "utf8", mode: 0o600 }))
+      .catch(() => undefined);
+  }
+
+  private loadRuns(): void {
+    try {
+      const parsed = JSON.parse(readFileSync(this.runsPath, "utf8")) as RunSummary[];
+      if (Array.isArray(parsed)) this.runs.push(...parsed.slice(-MAX_TRACKED_RUNS));
+    } catch {
+      // No history yet, or it is unreadable; either way start fresh.
+    }
   }
 }
 

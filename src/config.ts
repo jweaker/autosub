@@ -37,6 +37,11 @@ export interface AppConfig {
   /** How long a subtitle request waits for the play redirect to name the release. */
   streamWaitMs: number;
   tmdbToken?: string;
+  /**
+   * `auto` translates whenever nothing matches, `manual` only when the viewer
+   * asks for it from the subtitle menu, `off` never.
+   */
+  translationMode: "auto" | "manual" | "off";
   gemini: { apiKey?: string; model: string; concurrency: number };
   deepgram: { apiKey?: string; model: string };
   openSubtitles: {
@@ -93,6 +98,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     streamTtlMs: asNumber(env.STREAM_TTL_HOURS, 6, 0.25, 168) * 3_600_000,
     cacheTtlMs: asNumber(env.CACHE_TTL_DAYS, 30, 0, 3_650) * 86_400_000,
     rateLimitPerMinute: asInt(env.RATE_LIMIT_PER_MINUTE, 180, 10, 100_000),
+    translationMode: env.TRANSLATION_MODE === "auto" || env.TRANSLATION_MODE === "off" ? env.TRANSLATION_MODE : "manual",
     statusMessages: env.STATUS_MESSAGES !== "false",
     statusBanner: env.STATUS_BANNER !== "false",
     menuEntries: env.MENU_ENTRIES !== "false",
@@ -131,7 +137,7 @@ export function configWarnings(config: AppConfig): string[] {
   if (!config.upstreamAddonUrl) warnings.push("UPSTREAM_ADDON_URL is unset; AutoSub will return no streams");
   if (!config.publicUrl.startsWith("https://")) warnings.push(`PUBLIC_URL is not HTTPS (${config.publicUrl}); Stremio clients may refuse to install the addon`);
   if (!config.audioAnalysisEnabled) warnings.push("AUDIO_ANALYSIS_ENABLED=false; subtitles cannot be validated and every request will fail");
-  if (!config.gemini.apiKey) warnings.push("GEMINI_API_KEY is unset; translation fallback is disabled");
+  if (!config.gemini.apiKey && config.translationMode !== "off") warnings.push("GEMINI_API_KEY is unset; translation fallback is disabled");
   if (!config.deepgram.apiKey) warnings.push("DEEPGRAM_API_KEY is unset; falling back to speech-activity matching only");
   return warnings;
 }

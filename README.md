@@ -38,6 +38,7 @@ Stremio gives an addon no way to show a spinner, so AutoSub reports itself throu
 | `Arabic` | The normal entry. Your preferred-language setting still auto-selects it. |
 | `Arabic - try another (AutoSub)` | Select this if the subtitle is wrong. |
 | `Arabic - try another #2 / #3` | Same thing again, for a second and third rejection. |
+| `Arabic - AI translate, uses credits` | Only when nothing matched: pay for a translation, explicitly. |
 | `AutoSub: found on opensubtitles (81%)` | Shown on a warm play, when the answer is already known. |
 | `AutoSub: AI translated from English (74%)` | Same, for a translated result. |
 
@@ -59,8 +60,9 @@ Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` 
 4. **Speech timeline.** WebRTC VAD builds a local speech-activity timeline; Deepgram adds word-level timestamps. Quiet or failed samples are selectively replaced, and a mislabelled audio track falls back to language detection.
 5. **Candidate search.** OpenSubtitles, SubDL, and SubSource are searched concurrently and the results ranked by hash match, release-name similarity, source, group, edition, and frame rate.
 6. **Validation.** Candidates are downloaded in waves — the best entry from each provider at a time — and scored against the speech timeline. A global model corrects constant delay and constrained frame-rate drift (50 ms / 0.01% precision). Anything that only fits in places is rejected.
-7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. Otherwise Gemini translates the corrected source text under a fixed schema; timestamps never leave this process.
-8. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
+7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. A source track that no candidate can align to is discarded and the next best one tried, because a subtitle cut for a different edit can match the audio and still be a useless reference.
+8. **Translation, only if asked.** When no candidate matches any trusted track, AutoSub says so and offers a translation from the subtitle menu. Gemini then translates the corrected source text under a fixed schema; timestamps never leave this process. Set `TRANSLATION_MODE=auto` to have it happen unprompted, or `off` to disable it.
+9. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
 
 If nothing passes, AutoSub says so rather than serving a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
 
@@ -136,6 +138,7 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `MENU_ENTRIES` | `true` | Add the "try another" rows, and a result row on warm plays |
 | `RETRY_ENTRIES` | `3` | How many "try another" rows, each usable once per playback |
 | `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
+| `TRANSLATION_MODE` | `manual` | `manual` offers translation in the menu, `auto` runs it unprompted, `off` disables it |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
 

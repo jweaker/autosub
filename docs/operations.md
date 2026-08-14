@@ -14,6 +14,7 @@
 | `GET /:token/subtitles/:type/:id[/:extra].json` | Subtitle list for the release being played |
 | `GET /:token/file/:jobId.srt` | The finished subtitle |
 | `GET /:token/next/:jobId[/:attempt].srt` | Rejects the current subtitle and serves the next candidate |
+| `GET /:token/translate/:jobId.srt` | Translates the trusted timing track on request |
 
 Anything with a wrong token returns 404, compared in constant time.
 
@@ -57,7 +58,7 @@ curl -fsS "$PUBLIC_URL/$INSTALL_TOKEN/stats" | jq '.runs[0]'
 }
 ```
 
-`audio` almost always dominates a cold run, and it is bandwidth, not CPU: sampling reads the interleaved container, so the cost scales with the release's bitrate. `AUDIO_BUDGET_MB` caps it. `outcome` is `cached`, `direct`, `translated` or `failed`.
+Translated runs also carry a `translation` block with the cue count and the tokens the model actually charged for, which is the only honest way to know what a title cost. `audio` almost always dominates a cold run, and it is bandwidth, not CPU: sampling reads the interleaved container, so the cost scales with the release's bitrate. `AUDIO_BUDGET_MB` caps it. `outcome` is `cached`, `direct`, `translated` or `failed`.
 
 ## Status codes
 
@@ -106,6 +107,7 @@ Warnings that are normal in small numbers: a provider search failing (the others
 ```
 data/streams.json      play-link registry
 data/rejections.json   subtitles the viewer marked as wrong, per release
+data/runs.json         the last 25 run summaries served by /stats
 data/subtitles/        cached results
 ```
 
