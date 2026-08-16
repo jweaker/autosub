@@ -128,10 +128,17 @@ On a Raspberry Pi 4, a cold run that finds a direct subtitle typically takes aro
 ## Updating
 
 ```bash
-git pull
-docker compose build --pull
-docker compose up -d
+scripts/deploy.sh
 ```
+
+It backs up `.env` and `data/`, fast-forwards to `origin/main`, rebuilds, and waits
+for the container to report healthy.
+
+The script refuses to run when the checkout has local changes, and that refusal is
+the point. Editing source directly on the host makes every later `git pull` fail
+quietly, so the files drift ahead while git still reports an old commit and there is
+no longer a reliable answer to "what is deployed?". Change code in git, push, then
+deploy.
 
 Nothing about the addon URL changes across updates, so Stremio does not need to reinstall anything. The manifest URL only changes if you change `PUBLIC_URL` or `INSTALL_TOKEN` — those do require reinstalling in every client.
 
