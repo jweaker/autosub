@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CompletedSubtitle, SubtitleCue } from "../src/domain.js";
 import { parseSrt } from "../src/srt.js";
-import { exhaustedTrack, failedLabel, noticeTrack, resultLabel, retryLabel, translateLabel, withBanner } from "../src/status.js";
+import { bannerText, noticeTrack, preparingTrack, withBanner } from "../src/status.js";
 
 const result = (overrides: Partial<CompletedSubtitle> = {}): CompletedSubtitle => ({
   key: "k",
@@ -16,41 +16,13 @@ const result = (overrides: Partial<CompletedSubtitle> = {}): CompletedSubtitle =
 
 const cue = (startMs: number): SubtitleCue => ({ id: 1, startMs, endMs: startMs + 2_000, text: "dialogue" });
 
-describe("status labels", () => {
+describe("banner text", () => {
   it("names the provider for a found subtitle", () => {
-    expect(resultLabel(result())).toBe("SubDL 74%");
+    expect(bannerText(result())).toBe("[AutoSub] subdl subtitle - 74% match");
   });
 
   it("says where a translation came from", () => {
-    expect(resultLabel(result({ translated: true, sourceLanguage: "en" })))
-      .toBe("AI English 74%");
-  });
-
-  it("names the language first so the row reads like the list it sits in", () => {
-    expect(retryLabel("ar")).toBe("Arabic - Next");
-    expect(failedLabel()).toBe("No subtitle match");
-    expect(failedLabel(true)).toBe("No match - AI");
-  });
-
-  it("numbers further attempts so they read as successive tries", () => {
-    expect(retryLabel("ar", 2)).toBe("Arabic - Next 2");
-    expect(retryLabel("ar", 3)).toBe("Arabic - Next 3");
-  });
-
-  it("keeps menu labels short and free of symbols that TV fonts may not have", () => {
-    const labels = [
-      resultLabel(result()),
-      resultLabel(result({ provider: "an-unusually-long-provider-name" })),
-      resultLabel(result({ translated: true, sourceLanguage: "pt" })),
-      failedLabel(),
-      failedLabel(true),
-      retryLabel("pt", 3),
-      translateLabel("pt"),
-    ];
-    for (const label of labels) {
-      expect(label).toMatch(/^[\x20-\x7E]+$/);
-      expect(label.length).toBeLessThanOrEqual(18);
-    }
+    expect(bannerText(result({ translated: true, sourceLanguage: "en" }))).toBe("[AutoSub] AI translation from English - 74% match");
   });
 });
 
@@ -88,7 +60,7 @@ describe("notice tracks", () => {
     expect(cues.at(-1)?.endMs).toBeLessThanOrEqual(5 * 60_000 + 5_000);
   });
 
-  it("names the language it could not satisfy", () => {
-    expect(exhaustedTrack("ar")).toContain("No other Arabic subtitle passed validation");
+  it("names the language still being prepared", () => {
+    expect(preparingTrack("ar")).toContain("Still preparing the Arabic subtitle");
   });
 });

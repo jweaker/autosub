@@ -7,17 +7,18 @@ import { languageName } from "../languages.js";
  * Cues carry ids so a reordered or partial answer can be detected rather than
  * silently shifting every line onto the wrong timestamp.
  */
-export function translationPrompt(batch: SubtitleCue[], source: string, target: string): string {
+export function translationPrompt(batch: SubtitleCue[], source: string, target: string, context: string[] = []): string {
   const targetGuidance = target.split(/[-_]/)[0].toLowerCase() === "ar"
-    ? "Use natural Modern Standard Arabic suitable for film subtitles. Preserve tone, gender, names, jokes, and dramatic intent; avoid word-for-word calques and unnecessary transliteration."
+    ? "Use natural Modern Standard Arabic suitable for film subtitles. Preserve tone, gender, names, jokes, and dramatic intent; avoid word-for-word calques and unnecessary transliteration. Keep the gender of speaker and addressee consistent with the scene, and render names in their usual Arabic spelling."
     : `Write idiomatic ${languageName(target)}, preserving tone and dramatic intent rather than translating word for word.`;
   return [
     `Translate subtitle dialogue from ${languageName(source)} to ${languageName(target)}.`,
     "Return a JSON array where every cue appears exactly once with its unchanged numeric id.",
-    "Translate naturally for on-screen subtitles, using concise lines.",
+    "Translate naturally for on-screen subtitles: short, readable lines of at most about 42 characters each, never more than two lines per cue.",
     targetGuidance,
-    "Read neighbouring cues as one scene so pronouns, gender, names, and sentence fragments remain consistent.",
-    "Preserve speaker dashes, basic HTML/italics tags, names, intentional line breaks, and bracketed sound descriptions. Do not add commentary.",
+    "Read neighbouring cues as one scene so pronouns, gender, names, and sentence fragments remain consistent. A sentence split across cues must stay split across the same cues.",
+    "Preserve speaker dashes, basic HTML/italics tags, names, intentional line breaks, and bracketed sound descriptions (translated). Do not add commentary.",
+    ...(context.length ? [`Preceding lines, for context only; do not translate or return them: ${JSON.stringify(context)}`] : []),
     `Cues: ${JSON.stringify(batch.map(({ id, text }) => ({ id, text })))}`,
   ].join("\n");
 }

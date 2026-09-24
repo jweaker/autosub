@@ -35,6 +35,8 @@ const TRANSCRIBE_TIMEOUT_MS = 20_000;
 const MINIMUM_WINDOWS = 3;
 const MINIMUM_TRANSCRIPTS = 3;
 const MINIMUM_SAMPLE_SECONDS = 8;
+/** How far past AUDIO_BUDGET_MB the shortest windows may still go. */
+const MAX_BUDGET_OVERRUN = 4;
 const PROBE_SIZE_BYTES = 8 * 1024 * 1024;
 const PROBE_ANALYZE_US = 4_000_000;
 const UNKNOWN_DURATION_FALLBACK_MS = 90 * 60 * 1000;
@@ -296,7 +298,14 @@ export class AudioAnalyzer {
       format?: { duration?: string; size?: string; bit_rate?: string };
       streams?: ProbeStream[];
     };
-    const durationSeconds = [Number(data.format?.duration), ...(data.streams || []).map((stream) => Number(stream.duration))]
+    // Debrid services answer a removed or blocked file with a short stand-in
+    // clip (Real-Debrid's is 30 seconds). Sampling it only fails slowly and
+    // then blames the audio, so say what actually happened.
+    const formatSeconds = Number(data.format?.duration);
+    if (Number.isFinite(formatSeconds) && formatSeconds > 0 && formatSeconds < 60) {
+      throw new Error("The debrid service returned a short placeholder video instead of this release; pick another stream");
+    }
+    const durationSeconds = [formatSeconds, ...(data.streams || []).map((stream) => Number(stream.duration))]
       .filter((value) => Number.isFinite(value) && value >= 60)
       .reduce((longest, value) => Math.max(longest, value), 0);
     const durationKnown = durationSeconds >= 60;
@@ -398,6 +407,12 @@ export class AudioAnalyzer {
 
     const count = Math.max(MINIMUM_WINDOWS + 1, this.config.audioSampleCount);
     const seconds = sampleSecondsFor(this.config.audioSampleSeconds, count, this.config.audioBudgetBytes, bytesPerSecond);
+    // Mezzanine masters (ProRes, uncompressed) run at a gigabit or more; even
+    // the shortest windows would take minutes to pull and then time out, so
+    // say so at once instead of saturating the link for nothing.
+    if (bytesPerSecond && bytesPerSecond * seconds * count > this.config.audioBudgetBytes * MAX_BUDGET_OVERRUN) {
+      throw new Error(`This release is ${Math.round((bytesPerSecond * 8) / 1e6)} Mbps, too heavy to sample; pick a smaller stream`);
+    }
     // Skip credits at both ends when duration is known. Remote MP4s sometimes
     // omit it entirely; fixed, widening seeks keep those releases usable.
     const starts = sampleStartsFor(durationKnown ? durationMs : undefined, seconds, count);

@@ -6,7 +6,6 @@ import { configWarnings, loadConfig } from "./config.js";
 import { JobManager } from "./jobs.js";
 import { AutoSubPipeline } from "./pipeline.js";
 import { createProviders } from "./providers/index.js";
-import { RejectionStore } from "./rejections.js";
 import { StreamRegistry, UpstreamStreamAddon } from "./streams.js";
 
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
@@ -20,10 +19,8 @@ const registry = new StreamRegistry(join(config.dataDir, "streams.json"), config
 await registry.load();
 const upstream = new UpstreamStreamAddon(config.upstreamAddonUrl, registry);
 const cache = new SubtitleCache(config.dataDir);
-const rejections = new RejectionStore(config.dataDir);
-await rejections.load();
 const pipeline = new AutoSubPipeline(config, providers, cache);
-const jobs = new JobManager(pipeline, rejections);
+const jobs = new JobManager(pipeline);
 const app = createApp({ config, registry, upstream, jobs, providers, pipeline, cache });
 
 const server = app.listen(config.port, "0.0.0.0", () => {

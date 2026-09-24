@@ -1,12 +1,14 @@
 import type { SubtitleCue } from "../domain.js";
 import { HttpError, isTransient, requestJson } from "../http.js";
 import { collectRows, parseRows, translationPrompt } from "./prompt.js";
-import { assertTranslationChanged, batchCues, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
+import { assertTranslationChanged, batchCues, batchSizeFor, contextFor, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
 export interface OpenAiCompatibleSettings {
   baseUrl?: string;
   apiKey?: string;
   model: string;
+  /** Omitted from the request when unset; strict endpoints reject unknown fields. */
+  reasoningEffort?: string;
   concurrency: number;
   timeoutMs?: number;
 }
@@ -16,9 +18,10 @@ interface ChatResponse {
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
-// The gateway adds meaningful fixed context to every request. Film-sized
-// batches halve both that token overhead and wall time compared with the old
-// 60-cue limit, while resilient splitting still recovers a malformed answer.
+// The gateway adds meaningful fixed context to every request, so batches stay
+// large enough to amortise it (film-sized at 120) while shorter titles are
+// spread across every worker; resilient splitting recovers a malformed answer.
+const MIN_CUES_PER_BATCH = 40;
 const MAX_CUES_PER_BATCH = 120;
 const MAX_CHARACTERS_PER_BATCH = 18_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -58,14 +61,15 @@ export class OpenAiCompatibleTranslator implements Translator {
     return /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
   }
 
-  private body(batch: SubtitleCue[], source: string, target: string): string {
+  private body(batch: SubtitleCue[], source: string, target: string, context: string[]): string {
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: `${translationPrompt(batch, source, target)}\nRespond with {"cues": [...]}.` },
+      { role: "user", content: `${translationPrompt(batch, source, target, context)}\nRespond with {"cues": [...]}.` },
     ];
     if (this.minimalPayload) return JSON.stringify({ model: this.settings.model, messages });
     return JSON.stringify({
       model: this.settings.model,
+      ...(this.settings.reasoningEffort ? { reasoning_effort: this.settings.reasoningEffort } : {}),
       temperature: 0.15,
       // Honoured where supported; the parser recovers JSON from prose anyway.
       response_format: { type: "json_object" },
@@ -73,7 +77,7 @@ export class OpenAiCompatibleTranslator implements Translator {
     });
   }
 
-  private async translateBatch(batch: SubtitleCue[], source: string, target: string, usage: TranslationUsage, signal?: AbortSignal): Promise<Map<number, string>> {
+  private async translateBatch(batch: SubtitleCue[], source: string, target: string, context: string[], usage: TranslationUsage, signal?: AbortSignal): Promise<Map<number, string>> {
     let lastError: unknown;
     let attempt = 0;
     while (attempt < SCHEMA_ATTEMPTS) {
@@ -87,7 +91,7 @@ export class OpenAiCompatibleTranslator implements Translator {
           signal,
           timeoutMs: this.settings.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           label: `${this.settings.model} translation`,
-          body: this.body(batch, source, target),
+          body: this.body(batch, source, target, context),
         });
 
         usage.promptTokens = (usage.promptTokens || 0) + (body.usage?.prompt_tokens || 0);
@@ -116,10 +120,12 @@ export class OpenAiCompatibleTranslator implements Translator {
   async translate(cues: SubtitleCue[], source: string, target: string, signal?: AbortSignal): Promise<SubtitleCue[]> {
     if (!this.enabled) throw new Error("TRANSLATION_BASE_URL and TRANSLATION_MODEL are required for this translator");
     const usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
-    const batches = batchCues(cues, MAX_CUES_PER_BATCH, MAX_CHARACTERS_PER_BATCH);
+    const size = batchSizeFor(cues.length, this.effectiveConcurrency, MIN_CUES_PER_BATCH, MAX_CUES_PER_BATCH);
+    const batches = batchCues(cues, size, MAX_CHARACTERS_PER_BATCH);
+    const context = contextFor(cues);
     const translated = await runBatches(batches, this.effectiveConcurrency, (batch) => runBatchResiliently(
       batch,
-      (part) => this.translateBatch(part, source, target, usage, signal),
+      (part) => this.translateBatch(part, source, target, context(part), usage, signal),
     ), {
       onConcurrencyReduced: (concurrency) => {
         this.effectiveConcurrency = Math.min(this.effectiveConcurrency, concurrency);

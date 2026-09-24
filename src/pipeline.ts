@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, snapToSpeech, speechOffsetError } from "./alignment.js";
 import { AudioAnalyzer } from "./audio.js";
 import { stableKey, SubtitleCache } from "./cache.js";
-import type { AppConfig } from "./config.js";
+import { translationConfigured, type AppConfig } from "./config.js";
 import type { AudioProbeResult, CompletedSubtitle, RankedCandidate, StreamRecord, SubtitleCandidate, SubtitleCue, SubtitleProvider, SubtitleRequest } from "./domain.js";
 import { languageName, normalizeLanguage } from "./languages.js";
 import { MetadataService } from "./metadata.js";
@@ -15,11 +15,7 @@ import { prepareSubtitle } from "./subtitle-content.js";
 import { createTranslator, type Translator } from "./translation/index.js";
 
 /** Cache key version; bump when a change should invalidate stored subtitles. */
-const CACHE_VERSION = 10;
-// Rejections are decisions made against a particular matching/alignment engine.
-// Keep the historical data on disk, but do not let decisions from an older
-// engine permanently hide candidates that the current engine can now repair.
-const REJECTION_VERSION = 2;
+const CACHE_VERSION = 11;
 const PROBE_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_CACHED_PROBES = 12;
 const DOWNLOAD_TIMEOUT_MS = 20_000;
@@ -65,7 +61,8 @@ export interface RunSummary {
   speechErrorMs?: number;
   /** Retained because the process logs may be gone when a title is investigated. */
   failure?: string;
-  excluded?: number;
+  /** Providers whose search failed outright; a silent outage looks like "no subtitles". */
+  providerErrors?: Record<string, string>;
   evaluations?: Record<string, EvaluationSummary>;
 }
 
@@ -77,14 +74,6 @@ export interface EvaluationSummary {
   passed: number;
   bestConfidence: number;
   cleanup: { removed: number; merged: number; adjusted: number };
-}
-
-/** Raised instead of translating when the viewer has not asked to pay for it. */
-export class TranslationRequiredError extends Error {
-  constructor(readonly language: string) {
-    super(`No ${language} subtitle matched this release; an AI translation was not requested`);
-    this.name = "TranslationRequiredError";
-  }
 }
 
 interface Evaluated {
@@ -136,7 +125,7 @@ export class AutoSubPipeline {
   }
 
   /** Searches every provider at once; a provider that fails is logged, not fatal. */
-  private async search(request: SubtitleRequest, languages: string[]): Promise<SubtitleCandidate[]> {
+  private async search(request: SubtitleRequest, languages: string[], failures?: Record<string, string>): Promise<SubtitleCandidate[]> {
     if (!languages.length || !this.providers.length) return [];
     const query = { ...request, languages };
     // Providers retry internally; this budget bounds the whole attempt so one
@@ -157,6 +146,7 @@ export class AutoSubPipeline {
       const result = settled[index];
       if (result.status === "rejected") {
         console.warn(`${this.providers[index].name} search failed:`, describe(result.reason));
+        if (failures) failures[this.providers[index].name] = describe(result.reason).slice(0, 160);
         continue;
       }
       for (const candidate of result.value) unique.set(`${candidate.provider}:${candidate.providerId}`, candidate);
@@ -276,17 +266,19 @@ export class AutoSubPipeline {
     mark: <T>(stage: string, work: Promise<T>) => Promise<T>,
     referenceWasTrusted: boolean,
     evaluations: Record<string, EvaluationSummary>,
-  ): Promise<{ subtitle: Omit<CompletedSubtitle, "key">; evaluated: Evaluated; route: "reference" | "audio" } | undefined> {
+    providerErrors: Record<string, string>,
+  ): Promise<{ match?: { subtitle: Omit<CompletedSubtitle, "key">; evaluated: Evaluated; route: "reference" | "audio" }; reference?: Evaluated }> {
     const maxOffsetMs = this.config.maxSyncOffsetSeconds * 1000;
     const byActivity: Aligner = (cues) => alignSubtitle(cues, probe.windows, maxOffsetMs);
     const bar = this.config.activityMinimumConfidence;
 
     let trusted = referenceWasTrusted;
+    let reference: Evaluated | undefined;
     const languages = this.config.fallbackReferenceLanguages
       .filter((language) => language !== target && !sourceLanguages.includes(language));
     if (languages.length) {
-      const candidates = await mark("searchFallback", this.search(request, languages));
-      const reference = await mark("validateFallbackReference", this.evaluate(
+      const candidates = await mark("searchFallback", this.search(request, languages, providerErrors));
+      reference = await mark("validateFallbackReference", this.evaluate(
         request, candidates, byActivity, excluded, bar, evaluation(evaluations, "fallbackReference"),
       ));
       if (reference) {
@@ -303,16 +295,19 @@ export class AutoSubPipeline {
         ));
         if (matched) {
           return {
-            evaluated: matched,
-            route: "reference",
-            subtitle: {
-              id: variantId(matched.ranked.candidate),
-              language: target,
-              content: matched.content,
-              confidence: Math.min(reference.confidence, matched.confidence),
-              provider: matched.ranked.candidate.provider,
-              translated: false,
-              contentHash: matched.contentHash,
+            reference,
+            match: {
+              evaluated: matched,
+              route: "reference",
+              subtitle: {
+                id: variantId(matched.ranked.candidate),
+                language: target,
+                content: matched.content,
+                confidence: Math.min(reference.confidence, matched.confidence),
+                provider: matched.ranked.candidate.provider,
+                translated: false,
+                contentHash: matched.contentHash,
+              },
             },
           };
         }
@@ -340,38 +335,44 @@ export class AutoSubPipeline {
       if (corroborated && corroborated.ranked.score >= 35) {
         console.log(`A strongly ranked ${target} candidate overruled the rejected timing reference (audio=${corroborated.confidence}, release=${corroborated.ranked.score})`);
         return {
-          evaluated: corroborated,
-          route: "audio",
-          subtitle: {
-            id: variantId(corroborated.ranked.candidate),
-            language: target,
-            content: corroborated.content,
-            confidence: Math.min(corroborated.confidence, corroborated.ranked.score + 35),
-            provider: corroborated.ranked.candidate.provider,
-            translated: false,
-            contentHash: corroborated.contentHash,
+          reference,
+          match: {
+            evaluated: corroborated,
+            route: "audio",
+            subtitle: {
+              id: variantId(corroborated.ranked.candidate),
+              language: target,
+              content: corroborated.content,
+              confidence: Math.min(corroborated.confidence, corroborated.ranked.score + 35),
+              provider: corroborated.ranked.candidate.provider,
+              translated: false,
+              contentHash: corroborated.contentHash,
+            },
           },
         };
       }
       console.log(`Not falling back to speech activity for ${target}: a trusted timing track already rejected these candidates`);
-      return undefined;
+      return { reference };
     }
     const direct = await mark("validateTargetAudio", this.evaluate(
       request, targetCandidates, byActivity, excluded, bar, evaluation(evaluations, "targetAudio"),
     ));
-    if (!direct) return undefined;
+    if (!direct) return { reference };
     console.log(`Accepted a ${target} subtitle on speech activity alone (confidence=${direct.confidence})`);
     return {
-      evaluated: direct,
-      route: "audio",
-      subtitle: {
-        id: variantId(direct.ranked.candidate),
-        language: target,
-        content: direct.content,
-        confidence: direct.confidence,
-        provider: direct.ranked.candidate.provider,
-        translated: false,
-        contentHash: direct.contentHash,
+      reference,
+      match: {
+        evaluated: direct,
+        route: "audio",
+        subtitle: {
+          id: variantId(direct.ranked.candidate),
+          language: target,
+          content: direct.content,
+          confidence: direct.confidence,
+          provider: direct.ranked.candidate.provider,
+          translated: false,
+          contentHash: direct.contentHash,
+        },
       },
     };
   }
@@ -427,24 +428,9 @@ export class AutoSubPipeline {
     return accepted.sort((left, right) => weight(right) - weight(left))[0];
   }
 
-  private cacheKey(
-    request: SubtitleRequest,
-    stream: StreamRecord,
-    target: string,
-    excluded: string[],
-    forceTranslation: boolean,
-  ): string {
+  private cacheKey(request: SubtitleRequest, stream: StreamRecord, target: string): string {
     return stableKey({
       version: CACHE_VERSION,
-      // A viewer who explicitly chose the paid AI row asked a different
-      // question from one who chose the normal validated-subtitle row. Keeping
-      // these apart prevents a cached direct result from swallowing the force
-      // request, and prevents the generated result from replacing the direct
-      // subtitle on future plays.
-      forceTranslation,
-      // Rejected variants are part of the identity of the answer: the same
-      // release asked again after a rejection is a different question.
-      excluded: [...excluded].sort(),
       type: request.type,
       id: request.contentId,
       hash: request.videoHash,
@@ -459,7 +445,7 @@ export class AutoSubPipeline {
   }
 
   /**
-   * Fingerprint of the release itself, stable across rejections.
+   * Fingerprint of the release itself, used to share one job between requests.
    *
    * Deliberately derived from the stream record alone. The play redirect and
    * the subtitle list describe the same release with different detail — one
@@ -468,7 +454,6 @@ export class AutoSubPipeline {
    */
   releaseKey(request: SubtitleRequest, stream: StreamRecord, targetLanguage: string): string {
     return stableKey({
-      rejectionVersion: REJECTION_VERSION,
       type: request.type,
       id: request.contentId,
       streamFingerprint: stream.videoHash || stream.filename || stableKey(stream.url),
@@ -514,18 +499,7 @@ export class AutoSubPipeline {
     return stored;
   }
 
-  /**
-   * @param excludeIds Variant ids the viewer already rejected. A rejected
-   * translation also bars its source track, because reusing that track would
-   * produce the same translation again.
-   */
-  async complete(
-    originalRequest: SubtitleRequest,
-    stream: StreamRecord,
-    targetLanguage: string,
-    excludeIds: string[] = [],
-    translationRequested = false,
-  ): Promise<CompletedSubtitle> {
+  async complete(originalRequest: SubtitleRequest, stream: StreamRecord, targetLanguage: string): Promise<CompletedSubtitle> {
     const started = Date.now();
     const target = normalizeLanguage(targetLanguage) || targetLanguage;
     const request: SubtitleRequest = {
@@ -535,10 +509,11 @@ export class AutoSubPipeline {
       videoSize: originalRequest.videoSize || stream.videoSize,
       languages: [target],
     };
-    const excluded = new Set(excludeIds.map(sourceVariantId));
-    const key = this.cacheKey(request, stream, target, excludeIds, translationRequested);
+    const excluded = new Set<string>();
+    const key = this.cacheKey(request, stream, target);
     const stages: Record<string, number> = {};
     const evaluations: Record<string, EvaluationSummary> = {};
+    const providerErrors: Record<string, string> = {};
     let audioUsage: RunSummary["audio"];
     let speechError: number | undefined;
     const reportSpeechError = (error: number | undefined): void => { speechError = error; };
@@ -572,9 +547,13 @@ export class AutoSubPipeline {
         route,
         speechErrorMs: route ? speechError : undefined,
         failure,
-        excluded: excludeIds.length || undefined,
+        providerErrors: Object.keys(providerErrors).length ? providerErrors : undefined,
         evaluations: Object.keys(evaluations).length ? evaluations : undefined,
       });
+    };
+    const fail = (reason: string): never => {
+      summary("failed", undefined, undefined, undefined, reason);
+      throw new Error(reason);
     };
 
     try {
@@ -583,202 +562,175 @@ export class AutoSubPipeline {
         summary("cached", cached);
         return cached;
       }
-    if (!this.config.audioAnalysisEnabled) throw new Error("Audio analysis is disabled; refusing to guess a subtitle");
-    if (excludeIds.length) console.log(`Preparing ${target} for ${request.contentId} while skipping ${excludeIds.length} rejected subtitle(s)`);
+      if (!this.config.audioAnalysisEnabled) fail("Audio analysis is disabled; refusing to guess a subtitle");
 
-    const metadataLanguage = await mark("metadata", this.metadata.originalLanguage(request.imdbId, request.type));
-    const initialSourceLanguages = normalizedSet([metadataLanguage, ...this.config.referenceLanguages]);
+      const metadataLanguage = await mark("metadata", this.metadata.originalLanguage(request.imdbId, request.type));
+      const initialSourceLanguages = normalizedSet([metadataLanguage, ...this.config.referenceLanguages]);
 
-    // Audio analysis and the provider searches are independent; overlapping
-    // them removes several seconds from every cold start.
-    const analysis = this.analyze(stream, metadataLanguage);
-    const analysisPromise = mark("audio", analysis.probe);
-    const initialSourcePromise = mark("search", this.search(request, initialSourceLanguages));
-    const targetPromise = translationRequested
-      ? Promise.resolve([])
-      : initialSourceLanguages.includes(target)
-      ? initialSourcePromise
-      : mark("searchTarget", this.search(request, [target]));
+      // Audio analysis and the provider searches are independent; overlapping
+      // them removes several seconds from every cold start.
+      const analysis = this.analyze(stream, metadataLanguage);
+      const analysisPromise = mark("audio", analysis.probe);
+      const initialSourcePromise = mark("search", this.search(request, initialSourceLanguages, providerErrors));
+      const targetPromise = initialSourceLanguages.includes(target)
+        ? initialSourcePromise
+        : mark("searchTarget", this.search(request, [target], providerErrors));
 
-    const probe = await analysisPromise;
-    audioUsage = {
-      windows: probe.windows.length,
-      sampledSeconds: Number(probe.windows.reduce((total, window) => total + window.durationMs, 0).toFixed(0)) / 1000,
-      transcripts: probe.windows.filter((window) => Boolean(window.transcript)).length,
-      deepgramRequests: analysis.reused ? 0 : (probe.deepgramRequests || 0),
-      deepgramSeconds: analysis.reused ? 0 : (probe.deepgramSeconds || 0),
-      reused: analysis.reused,
-      megabitsPerSecond: probe.megabitsPerSecond,
-    };
-    const sourceLanguages = normalizedSet([...initialSourceLanguages, probe.audioLanguage]);
-    if (!sourceLanguages.length) throw new Error("Could not determine the original audio language");
+      const probe = await analysisPromise;
+      audioUsage = {
+        windows: probe.windows.length,
+        sampledSeconds: Number(probe.windows.reduce((total, window) => total + window.durationMs, 0).toFixed(0)) / 1000,
+        transcripts: probe.windows.filter((window) => Boolean(window.transcript)).length,
+        deepgramRequests: analysis.reused ? 0 : (probe.deepgramRequests || 0),
+        deepgramSeconds: analysis.reused ? 0 : (probe.deepgramSeconds || 0),
+        reused: analysis.reused,
+        megabitsPerSecond: probe.megabitsPerSecond,
+      };
+      const sourceLanguages = normalizedSet([...initialSourceLanguages, probe.audioLanguage]);
+      if (!sourceLanguages.length) fail("Could not determine the original audio language");
 
-    const missing = sourceLanguages.filter((language) => !initialSourceLanguages.includes(language));
-    const [initialSource, additionalSource, targetCandidates] = await Promise.all([
-      initialSourcePromise,
-      this.search(request, missing),
-      targetPromise,
-    ]);
-    const sourceCandidates = [...initialSource, ...additionalSource];
+      const missing = sourceLanguages.filter((language) => !initialSourceLanguages.includes(language));
+      const [initialSource, additionalSource, targetCandidates] = await Promise.all([
+        initialSourcePromise,
+        this.search(request, missing, providerErrors),
+        targetPromise,
+      ]);
+      const sourceCandidates = [...initialSource, ...additionalSource];
 
-    // The target files are needed next in almost every run; fetching them now
-    // overlaps their transfer with validating the source track.
-    if (!translationRequested && !sourceLanguages.includes(target)) this.prefetch(request, targetCandidates, excluded);
+      // The target files are needed next in almost every run; fetching them now
+      // overlaps their transfer with validating the source track.
+      if (!sourceLanguages.includes(target)) this.prefetch(request, targetCandidates, excluded);
 
-    // A source track can match the audio and still be useless as a timing
-    // reference — it may be cut for a different edit, or padded with stray cues
-    // that put its events nowhere near the target's. So a source that no target
-    // can align to is discarded and the next best one tried, rather than
-    // treating one bad reference as proof that no target subtitle fits.
-    const rejectedSources = new Set(excluded);
-    let source: Evaluated | undefined;
-    let attempt = 0;
-    for (; attempt < MAX_SOURCE_ATTEMPTS; attempt += 1) {
-      source = await mark(`validateSource${attempt || ""}`, this.evaluate(
-        request,
-        sourceCandidates,
-        (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
-        rejectedSources,
-        this.config.minimumConfidence,
-        evaluation(evaluations, "source"),
-      ));
-      if (!source) break;
-      log("Trusted timing", source, probe, started, stages);
+      // A source track can match the audio and still be useless as a timing
+      // reference — it may be cut for a different edit, or padded with stray cues
+      // that put its events nowhere near the target's. So a source that no target
+      // can align to is discarded and the next best one tried, rather than
+      // treating one bad reference as proof that no target subtitle fits.
+      const rejectedSources = new Set(excluded);
+      // The best transcript-validated track is kept as the translation source
+      // should no target subtitle fit any of them.
+      let bestSource: Evaluated | undefined;
+      for (let attempt = 0; attempt < MAX_SOURCE_ATTEMPTS; attempt += 1) {
+        const source = await mark(`validateSource${attempt || ""}`, this.evaluate(
+          request,
+          sourceCandidates,
+          (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
+          rejectedSources,
+          this.config.minimumConfidence,
+          evaluation(evaluations, "source"),
+        ));
+        if (!source) break;
+        bestSource ??= source;
+        log("Trusted timing", source, probe, started, stages);
 
-      // The dedicated menu row is an explicit request to generate an AI
-      // version even when a direct target-language subtitle already works.
-      // Once a source timing track is trusted, do not spend provider quota or
-      // latency proving an answer the viewer deliberately chose to override.
-      if (translationRequested) break;
+        const settledSource = sourceLanguages.includes(target)
+          ? this.settleOnSpeech(source.content, probe, variantId(source.ranked.candidate), reportSpeechError)
+          : undefined;
+        if (settledSource) {
+          const result = await this.store({
+            key,
+            id: variantId(source.ranked.candidate),
+            language: target,
+            content: settledSource,
+            confidence: source.confidence,
+            provider: source.ranked.candidate.provider,
+            translated: false,
+            contentHash: source.contentHash,
+          }, request);
+          summary("direct", result, undefined, "source");
+          return result;
+        }
 
-      const settledSource = sourceLanguages.includes(target)
-        ? this.settleOnSpeech(source.content, probe, variantId(source.ranked.candidate), reportSpeechError)
-        : undefined;
-      if (settledSource) {
-        const result = await this.store({
-          key,
-          id: variantId(source.ranked.candidate),
-          language: target,
-          content: settledSource,
-          confidence: source.confidence,
-          provider: source.ranked.candidate.provider,
-          translated: false,
-          contentHash: source.contentHash,
-        }, request);
-        summary("direct", result, undefined, "source");
-        return result;
+        const referenceCues = parseSrt(source.content);
+        const direct = await mark(`validateTarget${attempt || ""}`, this.evaluate(
+          request,
+          targetCandidates,
+          (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
+          excluded,
+          this.config.minimumConfidence,
+          evaluation(evaluations, "target"),
+        ));
+        const settledDirect = direct ? this.settleOnSpeech(direct.content, probe, variantId(direct.ranked.candidate), reportSpeechError) : undefined;
+        if (direct && settledDirect) {
+          log(`Direct ${target} subtitle`, direct, probe, started, stages);
+          const result = await this.store({
+            key,
+            id: variantId(direct.ranked.candidate),
+            language: target,
+            content: settledDirect,
+            confidence: Math.min(source.confidence, direct.confidence),
+            provider: direct.ranked.candidate.provider,
+            translated: false,
+            contentHash: direct.contentHash,
+          }, request);
+          summary("direct", result, undefined, "source");
+          return result;
+        }
+
+        console.warn(`No ${target} subtitle matched the ${source.ranked.candidate.provider}:${source.ranked.candidate.providerId} timing track; trying another source`);
+        rejectedSources.add(variantId(source.ranked.candidate));
+        rejectedSources.add(`content:${source.contentHash}`);
       }
 
-      const referenceCues = parseSrt(source.content);
-      const direct = await mark(`validateTarget${attempt || ""}`, this.evaluate(
-        request,
-        targetCandidates,
-        (cues) => alignSubtitleToReference(cues, referenceCues, this.config.maxSyncOffsetSeconds * 1000),
-        excluded,
-        this.config.minimumConfidence,
-        evaluation(evaluations, "target"),
-      ));
-      const settledDirect = direct ? this.settleOnSpeech(direct.content, probe, variantId(direct.ranked.candidate), reportSpeechError) : undefined;
-      if (direct && settledDirect) {
-        log(`Direct ${target} subtitle`, direct, probe, started, stages);
-        const result = await this.store({
-          key,
-          id: variantId(direct.ranked.candidate),
-          language: target,
-          content: settledDirect,
-          confidence: Math.min(source.confidence, direct.confidence),
-          provider: direct.ranked.candidate.provider,
-          translated: false,
-          contentHash: direct.contentHash,
-        }, request);
-        summary("direct", result, undefined, "source");
-        return result;
-      }
-
-      console.warn(`No ${target} subtitle matched the ${source.ranked.candidate.provider}:${source.ranked.candidate.providerId} timing track; trying another source`);
-      rejectedSources.add(variantId(source.ranked.candidate));
-      rejectedSources.add(`content:${source.contentHash}`);
-      source = undefined;
-    }
-
-    // Nothing in the spoken language could carry the timing. The audio itself
-    // is language-independent evidence, so a subtitle in another language can
-    // be checked against speech activity and then vouch for the target — which
-    // is what matters for a film whose original language has a handful of
-    // subtitles but whose English catalogue has hundreds.
-    const fallback = translationRequested ? undefined : await this.matchWithoutSpokenSource(
-      request, probe, targetCandidates, excluded, sourceLanguages, target, mark,
-      rejectedSources.size > excluded.size, evaluations,
-    );
-    const settledFallback = fallback ? this.settleOnSpeech(fallback.subtitle.content, probe, fallback.subtitle.id, reportSpeechError) : undefined;
-    if (fallback && settledFallback) {
-      const result = await this.store({ key, ...fallback.subtitle, content: settledFallback }, request);
-      log(`Fallback ${target} subtitle`, fallback.evaluated, probe, started, stages);
-      summary("direct", result, undefined, fallback.route);
-    return result;
-    }
-
-    if (!source) {
-      const firstSource = await this.evaluate(
-        request,
-        sourceCandidates,
-        (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
-        excluded,
-        this.config.minimumConfidence,
-        evaluation(evaluations, "sourceRecovery"),
+      // Nothing in the spoken language could carry the timing. The audio itself
+      // is language-independent evidence, so a subtitle in another language can
+      // be checked against speech activity and then vouch for the target — which
+      // is what matters for a film whose original language has a handful of
+      // subtitles but whose English catalogue has hundreds.
+      const fallback = await this.matchWithoutSpokenSource(
+        request, probe, targetCandidates, excluded, sourceLanguages, target, mark,
+        Boolean(bestSource), evaluations, providerErrors,
       );
-      if (!firstSource) {
-        const reason = `No subtitle in ${sourceLanguages.join(", ")} matched the transcribed audio`;
-        summary("failed", undefined, undefined, undefined, reason);
-        throw new Error(reason);
+      const settledFallback = fallback.match ? this.settleOnSpeech(fallback.match.subtitle.content, probe, fallback.match.subtitle.id, reportSpeechError) : undefined;
+      if (fallback.match && settledFallback) {
+        const result = await this.store({ key, ...fallback.match.subtitle, content: settledFallback }, request);
+        log(`Fallback ${target} subtitle`, fallback.match.evaluated, probe, started, stages);
+        summary("direct", result, undefined, fallback.match.route);
+        return result;
       }
-      source = firstSource;
-    }
 
-    const referenceCues = parseSrt(source.content);
-    const sourceLanguage = normalizeLanguage(source.ranked.candidate.language) || sourceLanguages[0];
-    // Translation is the only step that costs money per title, so unless the
-    // operator asked for it to happen by itself, the viewer decides.
-    if (this.config.translationMode === "off" || (this.config.translationMode === "manual" && !translationRequested)) {
-      summary("failed", undefined, undefined, undefined, `No ${target} subtitle matched; AI translation was not requested`);
-      throw new TranslationRequiredError(languageName(target));
-    }
-    if (sourceLanguage === target) {
-      const reason = `Cannot AI translate ${languageName(sourceLanguage)} into the same language`;
-      summary("failed", undefined, undefined, undefined, reason);
-      throw new Error(reason);
-    }
-    const reason = translationRequested ? "AI translation explicitly requested" : `No direct ${target} timing match`;
-    console.log(`${reason}; translating trusted ${sourceLanguage} timing with ${this.translator.name} (${this.config.translation.model})`);
-    const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
-    // A translation carries the timing of the track it was translated from, so
-    // it answers to the audio like everything else.
-    const settledTranslation = this.settleOnSpeech(serializeSrt(translated), probe, "the translation", reportSpeechError);
-    if (!settledTranslation) {
-      const reason = `The ${sourceLanguage} timing track does not match the audio closely enough to translate from`;
-      summary("failed", undefined, undefined, undefined, reason);
-      throw new Error(reason);
-    }
-    const result = await this.store({
-      key,
-      id: `${TRANSLATED_PREFIX}${variantId(source.ranked.candidate)}`,
-      language: target,
-      content: settledTranslation,
-      confidence: source.confidence,
-      provider: `${source.ranked.candidate.provider}+${this.translator.name}`,
-      translated: true,
-      sourceLanguage,
-      contentHash: stableKey(settledTranslation),
-      sourceContentHash: source.contentHash,
-    }, request);
-    const usage = this.translator.usageFor?.(translated) || this.translator.lastUsage;
-    summary("translated", result, {
-      cues: referenceCues.length,
-      characters: usage?.characters ?? 0,
-      promptTokens: usage?.promptTokens,
-      responseTokens: usage?.responseTokens,
-    }, "source");
-    console.log(`Translated ${referenceCues.length} cues to ${target} with ${this.translator.name}; characters=${usage?.characters ?? "?"} tokensIn=${usage?.promptTokens ?? "-"} tokensOut=${usage?.responseTokens ?? "-"}`);
+      // No existing target subtitle fits, so one is generated. A track checked
+      // against the words actually spoken is the better timing source; a
+      // track checked against speech activity is the next best, and for films
+      // whose original language has no subtitles at all it is the only one.
+      const source = bestSource || fallback.reference;
+      if (!source) {
+        const tried = [...new Set([...sourceLanguages, ...this.config.fallbackReferenceLanguages])].filter((language) => language !== target);
+        fail(`No subtitle in ${tried.join(", ")} matched the audio of this release`);
+      }
+      if (!translationConfigured(this.config)) fail(`No ${languageName(target)} subtitle matched and AI translation is not configured`);
+      const translationSource = source as Evaluated;
+      const route = bestSource ? "source" : "reference";
+      const sourceLanguage = normalizeLanguage(translationSource.ranked.candidate.language) || sourceLanguages[0];
+      if (sourceLanguage === target) fail(`Cannot AI translate ${languageName(sourceLanguage)} into the same language`);
+
+      const referenceCues = parseSrt(translationSource.content);
+      console.log(`No ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.translator.name} (${this.config.translation.model})`);
+      const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
+      // A translation carries the timing of the track it was translated from, so
+      // it answers to the audio like everything else.
+      const settledTranslation = this.settleOnSpeech(serializeSrt(translated), probe, "the translation", reportSpeechError);
+      if (!settledTranslation) fail(`The ${sourceLanguage} timing track does not match the audio closely enough to translate from`);
+      const result = await this.store({
+        key,
+        id: `${TRANSLATED_PREFIX}${variantId(translationSource.ranked.candidate)}`,
+        language: target,
+        content: settledTranslation as string,
+        confidence: translationSource.confidence,
+        provider: `${translationSource.ranked.candidate.provider}+${this.translator.name}`,
+        translated: true,
+        sourceLanguage,
+        contentHash: stableKey(settledTranslation),
+        sourceContentHash: translationSource.contentHash,
+      }, request);
+      const usage = this.translator.usageFor?.(translated) || this.translator.lastUsage;
+      summary("translated", result, {
+        cues: referenceCues.length,
+        characters: usage?.characters ?? 0,
+        promptTokens: usage?.promptTokens,
+        responseTokens: usage?.responseTokens,
+      }, route);
+      console.log(`Translated ${referenceCues.length} cues to ${target} with ${this.translator.name}; characters=${usage?.characters ?? "?"} tokensIn=${usage?.promptTokens ?? "-"} tokensOut=${usage?.responseTokens ?? "-"}`);
       return result;
     } catch (error) {
       if (!summarized) summary("failed", undefined, undefined, undefined, describe(error));
@@ -787,8 +739,9 @@ export class AutoSubPipeline {
   }
 
   /**
-   * Audio analysis is by far the slowest step, and "try another" asks the same
-   * questions of the same audio, so a probe is kept in memory for the release.
+   * Audio analysis is by far the slowest step, and a failed run retried on the
+   * next play asks the same questions of the same audio, so a probe is kept in
+   * memory for the release.
    * Reusing the object also reuses the aligner's per-window precomputation.
    */
   private analyze(stream: StreamRecord, metadataLanguage: string | undefined): { probe: Promise<AudioProbeResult>; reused: boolean } {
@@ -834,13 +787,6 @@ export class AutoSubPipeline {
 }
 
 const TRANSLATED_PREFIX = "translated:";
-
-function sourceVariantId(id: string): string {
-  if (id.startsWith(TRANSLATED_PREFIX)) return id.slice(TRANSLATED_PREFIX.length);
-  // Entries written before the provider-neutral prefix are still understood.
-  if (id.startsWith("gemini:")) return id.slice("gemini:".length);
-  return id;
-}
 
 function variantId(candidate: SubtitleCandidate): string {
   return `${candidate.provider}:${candidate.providerId}`;

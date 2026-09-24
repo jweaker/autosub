@@ -186,6 +186,42 @@ describe("audio alignment", () => {
     expect(Math.abs(result.offsetMs - trueOffset)).toBeLessThan(300);
   });
 
+  it("times Japanese from recognised words that arrive one character at a time", () => {
+    // Recognisers return Japanese nearly character by character. Each of those
+    // must still count as evidence, or the only anchor left is speech activity,
+    // which music and effects can hide completely.
+    const kanji = (index: number, count: number): string =>
+      Array.from({ length: count }, (_, offset) => String.fromCodePoint(0x4e00 + index * 11 + offset)).join("");
+    const cues: SubtitleCue[] = Array.from({ length: 200 }, (_, index) => ({
+      id: index + 1,
+      startMs: 10_000 + index * 6_000,
+      endMs: 10_000 + index * 6_000 + 3_800,
+      text: kanji(index, 8),
+    }));
+    const trueOffset = 5_000;
+    const lead = 300;
+    const starts = [30_000, 300_000, 600_000, 900_000];
+    const windows: VadWindow[] = starts.map((startMs) => {
+      const inside = cues.filter((cue) => cue.endMs + trueOffset >= startMs && cue.startMs + trueOffset <= startMs + 25_000);
+      return {
+        startMs,
+        durationMs: 25_000,
+        speech: [],
+        transcript: inside.map((cue) => cue.text).join(""),
+        words: inside.flatMap((cue) => [...cue.text].map((word, index) => ({
+          word,
+          startMs: cue.startMs + trueOffset - startMs + lead + index * 180,
+          endMs: cue.startMs + trueOffset - startMs + lead + index * 180 + 160,
+          confidence: 0.95,
+        }))),
+      };
+    });
+
+    const result = alignSubtitleToTranscript(cues, windows, 30_000);
+    expect(result.confidence).toBeGreaterThanOrEqual(58);
+    expect(Math.abs(result.offsetMs - trueOffset)).toBeLessThan(400);
+  });
+
   it("leaves an already well-timed subtitle where it is", () => {
     // Speech beginning a moment after the cue appears is exactly the convention
     // subtitles are written to; nudging that would trade one small error for

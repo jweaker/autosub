@@ -9,8 +9,7 @@ import { SubtitleCache } from "../src/cache.js";
 import { loadConfig } from "../src/config.js";
 import type { CompletedSubtitle, StreamRecord, SubtitleRequest } from "../src/domain.js";
 import { JobManager } from "../src/jobs.js";
-import { type AutoSubPipeline, TranslationRequiredError } from "../src/pipeline.js";
-import { RejectionStore } from "../src/rejections.js";
+import type { AutoSubPipeline } from "../src/pipeline.js";
 import { StreamRegistry, UpstreamStreamAddon } from "../src/streams.js";
 
 const TOKEN = "0".repeat(64);
@@ -50,11 +49,10 @@ async function start(complete: AutoSubPipeline["complete"], environment: Record<
     DATA_DIR: dataDir,
     JOB_WAIT_MS: "5000",
     STREAM_WAIT_MS: "300",
-    STATUS_PROBE_MS: "1500",
     ...environment,
   });
   registry = new StreamRegistry(join(dataDir, "streams.json"), config.publicUrl, config.installToken);
-  jobs = new JobManager(stubPipeline(complete), new RejectionStore(dataDir));
+  jobs = new JobManager(stubPipeline(complete));
   cache = new SubtitleCache(dataDir);
   const app = createApp({
     config,
@@ -104,76 +102,15 @@ describe("addon HTTP surface", () => {
     expect(health.version).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("lists the language entry plus a status and a retry entry", async () => {
+  it("lists exactly one Arabic entry", async () => {
     await start(async () => subtitle());
     await playStream();
     const subtitles = await listSubtitles();
-
+    // The plain ISO code is what Stremio's preferred-language setting matches.
+    expect(subtitles).toHaveLength(1);
     expect(subtitles[0].lang).toBe("ara");
-    expect(subtitles[1].lang).toContain("OpenSubs");
-    expect(subtitles[1].lang).toContain("81%");
-    expect(subtitles.slice(2).map((entry) => entry.lang)).toEqual([
-      "Arabic - Next",
-      "Arabic - Next 2",
-      "Arabic - Next 3",
-    ]);
-    // Distinct URLs, because a player will not re-request a track it already
-    // loaded — one shared URL could only ever be used once per playback.
-    const retryUrls = new Set(subtitles.slice(2).map((entry) => entry.url));
-    expect(retryUrls.size).toBe(3);
-  });
-
-  it("walks further down the list on each retry row", async () => {
-    const order = ["opensubtitles:1", "subdl:2", "subsource:3", "subdl:4"];
-    const complete = vi.fn(async (_request, _stream, _language, exclude: string[] = []) => {
-      const id = order[exclude.length];
-      if (!id) throw new Error("No subtitle in en matched the transcribed audio");
-      return subtitle({ id, provider: id.split(":")[0], confidence: 90 - exclude.length });
-    });
-    await start(complete as unknown as AutoSubPipeline["complete"]);
-    await playStream();
-    const entries = await listSubtitles();
-    const retries = entries.filter((entry) => entry.url.includes("/next/"));
-
-    const variants = [];
-    for (const retry of retries) variants.push((await fetch(local(retry.url))).headers.get("x-autosub-variant"));
-    expect(variants).toEqual(["subdl:2", "subsource:3", "subdl:4"]);
-    // Whatever the viewer settles on is what the plain language row serves.
-    expect((await fetch(local(entries[0].url))).headers.get("x-autosub-variant")).toBe("subdl:4");
-  });
-
-  it("says AI translated when the result came from the model", async () => {
-    await start(async () => subtitle({ translated: true, provider: "subdl+gemini", sourceLanguage: "en", id: "gemini:subdl:7" }));
-    await playStream();
-    const subtitles = await listSubtitles();
-    expect(subtitles[1].lang).toContain("AI English");
-  });
-
-  it("shows no status row while work is still running", async () => {
-    // The player fetches this list once, so a "preparing" row written now would
-    // still claim to be preparing long after the subtitle arrived.
-    await start(() => new Promise<CompletedSubtitle>(() => undefined), { STATUS_PROBE_MS: "50", RETRY_ENTRIES: "1" });
-    await playStream();
-    const subtitles = await listSubtitles();
-    expect(subtitles).toHaveLength(2);
-    expect(subtitles[0].lang).toBe("ara");
-    expect(subtitles[1].lang).toBe("Arabic - Next");
-  });
-
-  it("can be trimmed to a single row", async () => {
-    await start(async () => subtitle(), { RETRY_ENTRIES: "0" });
-    await playStream();
-    const subtitles = await listSubtitles();
-    expect(subtitles.filter((entry) => entry.url.includes("/next/"))).toHaveLength(0);
-  });
-
-  it("shows why nothing arrived when preparation already failed", async () => {
-    await start(async () => {
-      throw new Error("No subtitle in en matched the transcribed audio");
-    }, { STATUS_PROBE_MS: "500" });
-    await playStream();
-    const subtitles = await listSubtitles();
-    expect(subtitles[1].lang).toBe("No subtitle match");
+    expect(subtitles[0].id).toMatch(/^autosub-main-/);
+    expect(subtitles[0].url).toContain("/file/");
   });
 
   it("delivers the subtitle with a banner describing its origin", async () => {
@@ -200,103 +137,18 @@ describe("addon HTTP surface", () => {
     expect(await (await fetch(local(main.url))).text()).not.toContain("[AutoSub]");
   });
 
-  it("swaps in a different subtitle when the viewer asks for another", async () => {
-    const complete = vi.fn(async (_request, _stream, _language, exclude: string[] = []) =>
-      (exclude.includes("opensubtitles:1")
-        ? subtitle({ id: "subdl:2", provider: "subdl", content: srt("ترجمة أخرى"), confidence: 66 })
-        : subtitle()));
-    await start(complete as unknown as AutoSubPipeline["complete"]);
-    await playStream();
-    const entries = await listSubtitles();
-
-    const retry = await fetch(local(entries[2].url));
-    const body = await retry.text();
-    expect(retry.headers.get("x-autosub-variant")).toBe("subdl:2");
-    expect(body).toContain("ترجمة أخرى");
-
-    // The main entry now follows the replacement, and the rejection sticks.
-    expect((await fetch(local(entries[0].url))).headers.get("x-autosub-variant")).toBe("subdl:2");
-    const relisted = await listSubtitles();
-    expect(relisted[1].lang).toContain("SubDL");
-  });
-
-  it("offers an AI translation instead of buying one unasked", async () => {
-    const complete = vi.fn(async (_request, _stream, _language, _exclude: string[] = [], translate = false) => {
-      if (!translate) throw new TranslationRequiredError("Arabic");
-      return subtitle({ translated: true, provider: "opensubtitles+gemini", sourceLanguage: "en", id: "gemini:opensubtitles:1" });
-    });
-    await start(complete as unknown as AutoSubPipeline["complete"], { GEMINI_API_KEY: "k" });
-    await playStream();
-    const entries = await listSubtitles();
-
-    const offer = entries.find((entry) => entry.url.includes("/translate/"));
-    expect(offer?.lang).toBe("Arabic - AI (paid)");
-    expect(entries[1].lang).toBe("No match - AI");
-
-    // The plain row explains the situation rather than silently spending.
-    const plain = await fetch(local(entries[0].url));
-    expect(plain.headers.get("x-autosub-state")).toBe("translation-offered");
-    expect(await plain.text()).toContain("Arabic - AI (paid)");
-    expect(complete).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), true);
-
-    // Choosing it is what authorises the spend.
-    const translated = await fetch(local(offer?.url as string));
-    expect(translated.headers.get("x-autosub-translated")).toBe("true");
-  });
-
-  it("forces AI without replacing an already working normal subtitle", async () => {
-    const complete = vi.fn(async (_request, _stream, _language, _exclude: string[] = [], translate = false) =>
-      translate
-        ? subtitle({ translated: true, provider: "opensubtitles+openai", sourceLanguage: "en", id: "translated:opensubtitles:en" })
-        : subtitle());
-    await start(complete as unknown as AutoSubPipeline["complete"], { GEMINI_API_KEY: "k" });
-    await playStream();
-    const entries = await listSubtitles();
-    const normal = entries[0];
-    const force = entries.find((entry) => entry.url.includes("/translate/"));
-
-    expect((await fetch(local(normal.url))).headers.get("x-autosub-translated")).toBe("false");
-    expect((await fetch(local(force?.url as string))).headers.get("x-autosub-translated")).toBe("true");
-    expect(complete).toHaveBeenCalledWith(expect.anything(), expect.anything(), "ar", [], true);
-    expect((await fetch(local(normal.url))).headers.get("x-autosub-translated")).toBe("false");
-  });
-
-  it("keeps selector ids stable when a failed job is recreated", async () => {
+  it("keeps the selector id stable when a failed job is recreated", async () => {
     await start(async () => {
       throw new Error("No subtitle in en matched the transcribed audio");
-    }, { GEMINI_API_KEY: "k", STATUS_PROBE_MS: "100" });
+    });
     await playStream();
 
     const first = await listSubtitles();
+    await fetch(local(first[0].url));
     const second = await listSubtitles();
-    expect(second.map((entry) => entry.id)).toEqual(first.map((entry) => entry.id));
-
-    // The failed job itself was replaced, so its live URLs must change even
-    // though Stremio's selector identities do not.
-    expect(second.map((entry) => entry.url)).not.toEqual(first.map((entry) => entry.url));
-    expect(first.filter((entry) => entry.lang.includes("AI (paid)"))).toHaveLength(1);
-    expect(second.filter((entry) => entry.lang.includes("AI (paid)"))).toHaveLength(1);
-  });
-
-  it("hides the translation row when no model is configured", async () => {
-    await start(async () => subtitle());
-    await playStream();
-    expect((await listSubtitles()).some((entry) => entry.url.includes("/translate/"))).toBe(false);
-  });
-
-  it("explains when there is nothing else to try", async () => {
-    const complete = vi.fn(async (_request, _stream, _language, exclude: string[] = []) => {
-      if (exclude.length) throw new Error("No subtitle in en matched the transcribed audio");
-      return subtitle();
-    });
-    await start(complete as unknown as AutoSubPipeline["complete"]);
-    await playStream();
-    const entries = await listSubtitles();
-
-    const response = await fetch(local(entries[2].url));
-    expect(response.status).toBe(200);
-    expect(response.headers.get("x-autosub-state")).toBe("exhausted");
-    expect(await response.text()).toContain("No other Arabic subtitle passed validation");
+    expect(second[0].id).toBe(first[0].id);
+    // The failed job itself was replaced, so the next playback retries.
+    expect(second[0].url).not.toBe(first[0].url);
   });
 
   it("turns a failed preparation into a readable message", async () => {
@@ -318,7 +170,7 @@ describe("addon HTTP surface", () => {
   it("returns a real error instead of a message track when notices are disabled", async () => {
     await start(async () => {
       throw new Error("No subtitle in en matched the transcribed audio");
-    }, { STATUS_MESSAGES: "false", MENU_ENTRIES: "false" });
+    }, { STATUS_MESSAGES: "false" });
     await playStream();
     const [main] = await listSubtitles();
     expect((await fetch(local(main.url))).status).toBe(422);
@@ -378,11 +230,4 @@ describe("addon HTTP surface", () => {
     expect(await response.json()).toEqual({ subtitles: [] });
   });
 
-  it("keeps the menu to one entry when extras are disabled", async () => {
-    await start(async () => subtitle(), { MENU_ENTRIES: "false" });
-    await playStream();
-    const subtitles = await listSubtitles();
-    expect(subtitles).toHaveLength(1);
-    expect(subtitles[0].lang).toBe("ara");
-  });
 });

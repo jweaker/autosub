@@ -1,7 +1,6 @@
 export interface AppConfig {
   port: number;
   publicUrl: string;
-  defaultLanguages: string[];
   providerTimeoutMs: number;
   minimumConfidence: number;
   referenceLanguages: string[];
@@ -36,27 +35,18 @@ export interface AppConfig {
   statusMessages: boolean;
   /** Prepend a short "what you are watching" cue to finished subtitles. */
   statusBanner: boolean;
-  /** Add status and "try another" entries to the subtitle menu. */
-  menuEntries: boolean;
-  /** How many "try another" rows to offer, each usable once per playback. */
-  retryEntries: number;
-  /** How long the subtitle list waits before labelling a job as preparing. */
-  statusProbeMs: number;
   /** How long a subtitle request waits for the play redirect to name the release. */
   streamWaitMs: number;
   tmdbToken?: string;
-  /**
-   * `auto` translates whenever nothing matches, `manual` only when the viewer
-   * asks for it from the subtitle menu, `off` never.
-   */
-  translationMode: "auto" | "manual" | "off";
   translation: {
-    /** Which backend performs the translation when one is asked for. */
+    /** Which backend translates when no Arabic subtitle matches. */
     provider: "gemini" | "openai" | "deepl" | "libretranslate";
     apiKey?: string;
     /** Endpoint for OpenAI-compatible and self-hosted backends. */
     baseUrl?: string;
     model: string;
+    /** Sent to OpenAI-compatible endpoints that accept `reasoning_effort`. */
+    reasoningEffort: string;
     concurrency: number;
     /** Per-request deadline; reasoning models need more than a chat model. */
     timeoutMs: number;
@@ -96,12 +86,10 @@ const asList = (value: string | undefined): string[] =>
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const port = asInt(env.PORT, 7000, 1, 65_535);
   const publicUrl = (env.PUBLIC_URL || `http://127.0.0.1:${port}`).replace(/\/+$/, "");
-  const defaultLanguages = asList(env.DEFAULT_LANGUAGES);
 
   return {
     port,
     publicUrl,
-    defaultLanguages: defaultLanguages.length ? defaultLanguages : ["ar"],
     providerTimeoutMs: asInt(env.PROVIDER_TIMEOUT_MS, 8_000, 1_000, 60_000),
     minimumConfidence: asInt(env.MINIMUM_CONFIDENCE, 58, 0, 100),
     referenceLanguages: asList(env.REFERENCE_LANGUAGES),
@@ -125,12 +113,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     streamTtlMs: asNumber(env.STREAM_TTL_HOURS, 6, 0.25, 168) * 3_600_000,
     cacheTtlMs: asNumber(env.CACHE_TTL_DAYS, 30, 0, 3_650) * 86_400_000,
     rateLimitPerMinute: asInt(env.RATE_LIMIT_PER_MINUTE, 180, 10, 100_000),
-    translationMode: env.TRANSLATION_MODE === "auto" || env.TRANSLATION_MODE === "off" ? env.TRANSLATION_MODE : "manual",
     statusMessages: env.STATUS_MESSAGES !== "false",
     statusBanner: env.STATUS_BANNER !== "false",
-    menuEntries: env.MENU_ENTRIES !== "false",
-    retryEntries: asInt(env.RETRY_ENTRIES, 3, 0, 10),
-    statusProbeMs: asInt(env.STATUS_PROBE_MS, 2_000, 0, 15_000),
     streamWaitMs: asInt(env.STREAM_WAIT_MS, 12_000, 100, 60_000),
     tmdbToken: env.TMDB_API_TOKEN,
     translation: {
@@ -138,8 +122,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       apiKey: env.TRANSLATION_API_KEY || (asProvider(env.TRANSLATION_PROVIDER) === "gemini" ? env.GEMINI_API_KEY : undefined),
       baseUrl: env.TRANSLATION_BASE_URL,
       model: env.TRANSLATION_MODEL || env.GEMINI_MODEL || "gemini-3.5-flash",
+      reasoningEffort: env.TRANSLATION_REASONING_EFFORT || "medium",
       concurrency: asInt(env.TRANSLATION_CONCURRENCY, 12, 1, 12),
-      timeoutMs: asInt(env.TRANSLATION_TIMEOUT_MS, 120_000, 10_000, 600_000),
+      timeoutMs: asInt(env.TRANSLATION_TIMEOUT_MS, 300_000, 10_000, 900_000),
     },
     gemini: {
       apiKey: env.GEMINI_API_KEY,
@@ -179,11 +164,11 @@ export function configWarnings(config: AppConfig): string[] {
   if (!config.upstreamAddonUrl) warnings.push("UPSTREAM_ADDON_URL is unset; AutoSub will return no streams");
   if (!config.publicUrl.startsWith("https://")) warnings.push(`PUBLIC_URL is not HTTPS (${config.publicUrl}); Stremio clients may refuse to install the addon`);
   if (!config.audioAnalysisEnabled) warnings.push("AUDIO_ANALYSIS_ENABLED=false; subtitles cannot be validated and every request will fail");
-  if (config.translationMode !== "off" && !translationConfigured(config)) {
-    warnings.push(`Translation provider "${config.translation.provider}" is not fully configured; translation is unavailable`);
+  if (!translationConfigured(config)) {
+    warnings.push(`Translation provider "${config.translation.provider}" is not fully configured; titles without a matching Arabic subtitle will fail`);
   }
   if (!config.deepgram.apiKey) warnings.push("DEEPGRAM_API_KEY is unset; falling back to speech-activity matching only");
-  if (config.translationMode !== "off" && config.translation.concurrency === 1) {
+  if (config.translation.concurrency === 1) {
     warnings.push("TRANSLATION_CONCURRENCY=1 makes feature-film translation sequential and slow; use the endpoint's measured safe capacity when it allows parallel work");
   }
   return warnings;

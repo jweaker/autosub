@@ -22,9 +22,8 @@ Two consequences follow from that decision, and they explain most of the code:
 | `config.ts` | Environment parsing, range clamping, startup warnings |
 | `streams.ts` | Upstream addon client and the play-link registry |
 | `request.ts` | Parsing Stremio's subtitle request format |
-| `jobs.ts` | One pipeline run per release/language/rejection set, shared by all waiters |
-| `status.ts` | Menu labels, origin banner, and message tracks |
-| `rejections.ts` | Subtitles the viewer marked as wrong, per release |
+| `jobs.ts` | One pipeline run per release, shared by all waiters |
+| `status.ts` | Origin banner and message tracks |
 | `pipeline.ts` | Orchestration: search → validate → translate → cache |
 | `audio.ts` | ffprobe/ffmpeg sampling, VAD, Deepgram transcription |
 | `process.ts` | Child-process execution with timeouts and output limits |
@@ -52,25 +51,15 @@ GET /:token/play/:playId
 
 GET /:token/subtitles/:type/:id.json
     ├─ StreamRegistry.waitFor     (resolves the instant the play link is opened)
-    └─ one subtitle entry per configured language, each pointing at a job
+    └─ one Arabic entry pointing at the job
 
 GET /:token/file/:jobId.srt
     └─ JobManager.result          (awaits the shared job, up to JOB_WAIT_MS)
-
-GET /:token/next/:jobId[/:attempt].srt
-    ├─ RejectionStore.add         (this release will never serve that file again)
-    ├─ JobManager.start           (same release, larger exclusion set)
-    └─ the replacement subtitle
 ```
 
-Subtitle selector ids are stable for a media item, target language, and action.
-The delivery URL still contains the current ephemeral job id. This distinction
-lets Stremio replace refreshed rows after a restart instead of displaying the
-same force/retry action as another subtitle variant.
-
-The attempt number carries no meaning beyond making each retry row a distinct
-URL: players do not re-request a track they have already loaded, so a single
-shared URL could only be used once per playback.
+The subtitle selector id is stable for a media item; the delivery URL contains
+the current ephemeral job id. This lets Stremio replace a refreshed row after a
+restart instead of displaying it as another subtitle variant.
 
 The subtitle list is requested *before* or *around* the play redirect depending on the client, which is why `waitFor` exists: it blocks briefly on the registry rather than returning an empty list.
 
@@ -78,21 +67,21 @@ The subtitle list is requested *before* or *around* the play redirect depending 
 
 `AutoSubPipeline.complete()` runs the expensive path once per release and language:
 
-1. **Cache probe.** The key covers the media fingerprint, target language, rejection set, translation model, and whether the viewer explicitly forced AI. Direct and generated variants therefore coexist, and every rejection generation caches separately.
+1. **Cache probe.** The key covers the media fingerprint, target language, and translation model.
 2. **Parallel start.** Audio analysis and provider searches are launched together; the searches for the source language do not wait for the probe.
 3. **Source validation.** Candidates in the original language are aligned against the transcript (`alignSubtitleToTranscript`). The winner becomes the *trusted timing track*.
 4. **Target validation.** Candidates in the target language are aligned against that trusted track (`alignSubtitleToReference`). A match is served directly, with the lower of the two confidences.
 5. **Language-independent fallback.** If no subtitle in the spoken language can carry the timing, a subtitle in another language is validated against speech activity and used as the reference instead; failing that — and only when no timing track was trusted at all — the target is checked against speech activity directly. Once a track has been trusted, a target it rejected is not re-tried against weaker evidence: asking a lesser witness until one agrees is how a subtitle nobody vouched for reaches the screen. Speech activity does not care what language a subtitle is written in, which is what makes this possible — and it is weaker evidence, so both routes answer to `ACTIVITY_MINIMUM_CONFIDENCE`.
 6. **Strict audio recovery.** A trusted reference normally wins over weaker activity evidence. The exception is a target with both very high activity confidence and strong release-name evidence, because the reference itself may be a different edit. This narrow gate recovers known-release remux subtitles without admitting generic dense tracks.
-7. **Translation or explicit override.** If nothing matches, the configured engine translates the trusted track only when policy or the viewer allows it. Selecting the dedicated force row skips target-language candidate evaluation and translates the first audio-validated source track even when a direct result is already cached. It sees cue ids and text only. Independent batches run concurrently; a malformed large response is retried in smaller pieces.
+7. **Translation.** If nothing matches, the configured engine translates the best validated timing track automatically: the transcript-validated spoken-language track when there is one, otherwise the activity-validated reference from step 5. It sees cue ids and text only. Independent batches run concurrently; a malformed large response is retried in smaller pieces.
 8. **Settle and stabilize.** Whatever route produced the subtitle, it is measured against the speech in the sampled audio; because that measurement is signed, it is also the correction, so a track that inherited an error from its reference is pulled back onto the dialogue and only refused if it still misses by more than 1200 ms. Duplicate, one-frame, and tiny-overlap cues are removed or repaired so correct text does not flicker in the player.
 9. **Store.** Success is written to the cache; a cache write failure costs time on the next play but never fails the request.
 
-Each result carries a variant id — `provider:providerId`, or that id prefixed with `translated:` for a translation — plus a content fingerprint. A rejection bars both the id and identical content published under another provider id. Rejecting a translation bars its source track, because reusing that track would produce the same translation again. Audio probes are kept in memory per release, so a rejection-driven re-run skips ffmpeg entirely and finishes in seconds.
+Each result carries a variant id — `provider:providerId`, or that id prefixed with `translated:` for a translation — plus a content fingerprint. Audio probes are kept in memory per release, so a re-run after a failure skips ffmpeg entirely.
 
 Candidates are downloaded in waves of up to three, giving distinct providers first choice and then filling unused seats by rank. A borderline match triggers one extra wave so it cannot hide a much stronger file immediately behind it. The first target wave starts downloading while the source track is still being validated. A provider that reports a long quota cooldown is paused for that period instead of being retried for every candidate.
 
-Every run records the wall-clock cost of each stage, failure reason, exclusion count, candidate counts, best rejected confidence, and cue cleanup; `/stats` reports the last 25. Audio analysis dominates a cold run, so its length adapts to the release: sampling reads the interleaved container, and `AUDIO_BUDGET_MB` caps how much of it one analysis may pull.
+Every run records the wall-clock cost of each stage, failure reason, providers whose search failed, candidate counts, best rejected confidence, and cue cleanup; `/stats` reports the last 25. Audio analysis dominates a cold run, so its length adapts to the release: sampling reads the interleaved container, and `AUDIO_BUDGET_MB` caps how much of it one analysis may pull.
 
 ## Alignment
 
@@ -115,7 +104,6 @@ Everything that depends only on the inputs — sorted cue times, per-cue token s
 ```
 data/
 ├── streams.json          play-link registry (records + last selection per title)
-├── rejections.json       variant ids the viewer rejected, per release
 └── subtitles/
     ├── <key>.srt         finished subtitle
     └── <key>.json        provider, language, confidence, translated flag

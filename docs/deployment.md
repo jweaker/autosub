@@ -71,13 +71,15 @@ SubSource documents a 60 requests/minute and 7,200 requests/day limit. AutoSub s
 
 This supplies the original language, which selects both the audio track and the source-language subtitle search.
 
-### Gemini
+### Translation engine
+
+Any engine from [translation.md](translation.md) works; Gemini is the simplest to set up:
 
 1. Open [Google AI Studio API keys](https://aistudio.google.com/app/apikey).
 2. Create a key restricted to the Gemini API.
 3. Put it in `GEMINI_API_KEY`.
 
-`GEMINI_MODEL` is configurable because Google retires model versions. Translation runs only when no target-language subtitle passes validation.
+`GEMINI_MODEL` is configurable because Google retires model versions. Translation runs automatically, and only when no Arabic subtitle passes validation.
 
 ### Deepgram
 
@@ -103,7 +105,7 @@ docker compose ps
 curl -fsS http://127.0.0.1:7000/healthz
 ```
 
-Expect `upstream: true`, every configured provider listed, `audioAnalysis: true`, and `translation: gemini`. Startup warnings about a weak token, a non-HTTPS `PUBLIC_URL`, or a missing upstream appear in `docker compose logs autosub`.
+Expect `upstream: true`, every configured provider listed, `audioAnalysis: true`, and your translation engine under `translation`. Startup warnings about a weak token, a non-HTTPS `PUBLIC_URL`, or a missing upstream appear in `docker compose logs autosub`.
 
 Then confirm the private manifest from another machine:
 
@@ -140,7 +142,9 @@ quietly, so the files drift ahead while git still reports an old commit and ther
 no longer a reliable answer to "what is deployed?". Change code in git, push, then
 deploy.
 
-Nothing about the addon URL changes across updates, so Stremio does not need to reinstall anything. The manifest URL only changes if you change `PUBLIC_URL` or `INSTALL_TOKEN` — those do require reinstalling in every client.
+Nothing about the addon URL changes across updates, so Stremio does not need to reinstall anything.
+
+If your network blanks some provider hostnames on plain DNS (the dashboard lists a provider whose search fails on every run), set `DNS_SERVER` in `.env` to a resolver that answers them — Tailscale's `100.100.100.100` on a tailnet host. The manifest URL only changes if you change `PUBLIC_URL` or `INSTALL_TOKEN` — those do require reinstalling in every client.
 
 ## Running without Docker
 

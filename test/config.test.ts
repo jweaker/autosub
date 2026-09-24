@@ -6,7 +6,8 @@ const base = { INSTALL_TOKEN: "0".repeat(64), PUBLIC_URL: "https://autosub.test"
 describe("configuration", () => {
   it("applies documented defaults", () => {
     const config = loadConfig({ ...base });
-    expect(config).toMatchObject({ port: 7000, defaultLanguages: ["ar"], minimumConfidence: 58, candidateLimit: 10 });
+    expect(config).toMatchObject({ port: 7000, minimumConfidence: 58, candidateLimit: 10 });
+    expect(config.translation.reasoningEffort).toBe("medium");
     expect(config.translation.concurrency).toBe(12);
     expect(config.gemini.concurrency).toBe(12);
   });
@@ -16,9 +17,8 @@ describe("configuration", () => {
   });
 
   it("parses and normalizes language lists", () => {
-    const config = loadConfig({ ...base, DEFAULT_LANGUAGES: " AR , En ,", REFERENCE_LANGUAGES: "EN" });
-    expect(config.defaultLanguages).toEqual(["ar", "en"]);
-    expect(config.referenceLanguages).toEqual(["en"]);
+    const config = loadConfig({ ...base, REFERENCE_LANGUAGES: " EN , Fr ," });
+    expect(config.referenceLanguages).toEqual(["en", "fr"]);
   });
 
   it("clamps out-of-range numbers instead of trusting them", () => {

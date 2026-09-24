@@ -8,7 +8,7 @@ AutoSub is designed to be run by one person for their own household, reachable f
 - **Video never passes through AutoSub.** The play route records the release and issues a 302 to the debrid URL. Only addon metadata and finished subtitles cross the tunnel.
 - **Torrent-only results are dropped.** A stream without an HTTP(S) URL is never handed to a client, so AutoSub cannot cause a client to start a torrent.
 - **Provider responses are treated as untrusted input.** Download URLs are pinned to the provider's documented origin and path prefixes, archives are size-limited and filtered by extension before extraction, and header values taken from an upstream are stripped of CRLF before reaching FFmpeg.
-- **Timestamps never reach the language model.** Gemini receives cue ids and text under a fixed schema; the validated timing is reapplied locally.
+- **Timestamps never reach the language model.** The translation engine receives cue ids and text only; the validated timing is reapplied locally.
 
 ## Handling secrets
 

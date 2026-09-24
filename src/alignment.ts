@@ -6,7 +6,9 @@ const FINE_OFFSET_STEP_MS = 50;
 const FINE_RATE_STEP = 0.0001;
 const COMMON_RATES = [0.95904, 0.96, 0.999, 1, 1.001, 1.041667, 1.042709];
 const STOP_WORDS = new Set(["the", "and", "that", "this", "with", "from", "have", "you", "your", "for", "are", "was", "were", "but", "not", "what", "who", "how", "why", "can", "all"]);
-const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+// Scripts written without spaces between words, which are compared as
+// character bigrams instead of whitespace tokens.
+const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
 
 interface MappingScore {
   offsetMs: number;
@@ -75,7 +77,7 @@ function textTokens(text: string): Set<string> {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
   if (!normalized) return new Set();
-  if (CJK.test(normalized)) {
+  if (UNSPACED.test(normalized)) {
     const compact = normalized.replace(/\s+/g, "");
     return new Set(Array.from({ length: Math.max(0, compact.length - 1) }, (_, index) => compact.slice(index, index + 2)));
   }
@@ -149,6 +151,21 @@ class CueIndex {
   }
 }
 
+/**
+ * Tokens for one transcribed word.
+ *
+ * Recognisers split unspaced scripts into words of one or two characters —
+ * Japanese comes back almost character by character — and a single character
+ * forms no bigram, so those words used to carry no evidence at all. Borrowing
+ * the first character of the next word restores the bigram the cue text holds.
+ */
+function wordTokens(words: TranscriptWord[], index: number): Set<string> {
+  const text = words[index].word;
+  if (!UNSPACED.test(text)) return textTokens(text);
+  const next = words[index + 1]?.word.replace(/[^\p{L}\p{N}]/gu, "") || "";
+  return textTokens(UNSPACED.test(next) ? text + [...next][0] : text);
+}
+
 /** Per-window speech bins plus a scratch buffer reused by every evaluation. */
 interface WindowIndex {
   audio: Uint8Array;
@@ -164,9 +181,10 @@ function indexWindow(window: VadWindow): WindowIndex {
     const last = Math.min(bins.length - 1, Math.floor(interval.endMs / BIN_MS));
     for (let index = first; index <= last; index += 1) bins[index] = 1;
   }
-  const words = (window.words || [])
-    .filter((word) => (word.confidence ?? 1) >= 0.45)
-    .map((word) => ({ word, tokens: textTokens(word.word) }));
+  const all = window.words || [];
+  const words = all
+    .map((word, index) => ({ word, tokens: wordTokens(all, index) }))
+    .filter(({ word }) => (word.confidence ?? 1) >= 0.45);
   return {
     audio: bins,
     subtitle: new Uint8Array(bins.length),

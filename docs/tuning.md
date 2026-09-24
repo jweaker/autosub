@@ -91,7 +91,9 @@ Change one thing at a time and re-test against several real releases. `npm run s
 
 **Everything is translated even though target-language subtitles exist.** They were downloaded and rejected: their cue events did not match the trusted track. That is often correct — different cut, different release. Lower `MINIMUM_CONFIDENCE` only after checking a few by hand.
 
-**A delivered subtitle is wrong even though it passed.** Pick `Arabic - Next` in the subtitle menu. That records the file as rejected for this release forever and prepares the next best candidate, reusing the audio analysis. If it happens repeatedly on titles of the same kind, raise `MINIMUM_CONFIDENCE`; the rejections tell you where the current threshold is too generous.
+**A delivered subtitle is wrong even though it passed.** Delete that title's entry from the dashboard cache and check its run in `/stats`. If it happens repeatedly on titles of the same kind, raise `MINIMUM_CONFIDENCE` (or `ACTIVITY_MINIMUM_CONFIDENCE` when the route was `reference` or `audio`).
+
+**A non-English title finds nothing at all.** Check the dashboard's failure causes for a provider search failing on every run — a provider that cannot be reached looks exactly like a title nobody subtitled. OpenSubtitles carries most non-English catalogues, and on some networks its hostname only resolves through a non-ISP resolver (`DNS_SERVER`).
 
 **Cold runs are slow.** Check `/stats` first — `audio` almost always dominates, and it is bandwidth rather than CPU. Sampling reads the interleaved container, not just the audio track, so a window costs `bitrate x seconds` regardless of how little audio is in it: fifteen seconds of a 100 Mbit remux is ~190 MB, the same fifteen seconds of an 8 Mbit web release is ~15 MB.
 

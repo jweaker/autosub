@@ -1,3 +1,6 @@
+/** AutoSub delivers exactly one language. */
+export const TARGET_LANGUAGE = "ar";
+
 const TWO_TO_THREE: Record<string, string> = {
   ar: "ara", en: "eng", fr: "fra", de: "deu", es: "spa", it: "ita",
   ja: "jpn", ko: "kor", zh: "zho", tr: "tur", fa: "fas", ru: "rus",
@@ -11,6 +14,8 @@ export function normalizeLanguage(value?: string): string | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toLowerCase().split(/[-_]/)[0];
   if (["und", "unk", "unknown", "mul", "zxx"].includes(normalized)) return undefined;
+  // TMDB tags Cantonese as "cn", which no subtitle provider or recogniser knows.
+  if (normalized === "cn") return "zh";
   if (normalized.length === 2) return normalized;
   return THREE_TO_TWO[normalized] || normalized;
 }

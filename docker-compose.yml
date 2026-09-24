@@ -3,6 +3,13 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    # Resolver for the container. Some ISPs blank subtitle-provider hostnames
+    # on plain DNS (api.opensubtitles.com on this host), which silently turned
+    # the largest subtitle catalogue into "no results". Point DNS_SERVER at a
+    # resolver that answers them, e.g. Tailscale's 100.100.100.100.
+    dns:
+      - ${DNS_SERVER:-1.1.1.1}
+      - 1.1.1.1
     # Reaps orphaned ffmpeg/python children if a sample is killed mid-run.
     init: true
     volumes:

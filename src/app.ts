@@ -3,26 +3,14 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import { stableKey, type SubtitleCache } from "./cache.js";
 import { translationConfigured, type AppConfig } from "./config.js";
 import { renderDashboard } from "./dashboard.js";
-import type { CompletedSubtitle, StreamRecord, SubtitleProvider, SubtitleRequest } from "./domain.js";
+import type { CompletedSubtitle, SubtitleProvider, SubtitleRequest } from "./domain.js";
 import { HttpError } from "./http.js";
 import { JobExpiredError, type JobManager, JobTimeoutError } from "./jobs.js";
-import { stremioLanguage } from "./languages.js";
+import { stremioLanguage, TARGET_LANGUAGE } from "./languages.js";
 import { parseSubtitleRequest } from "./request.js";
 import { parseSrt, serializeSrt } from "./srt.js";
-import {
-  bannerText,
-  exhaustedTrack,
-  failedLabel,
-  failureTrack,
-  noticeTrack,
-  preparingTrack,
-  resultLabel,
-  retryLabel,
-  translateLabel,
-  translationOfferTrack,
-  withBanner,
-} from "./status.js";
-import { type AutoSubPipeline, TranslationRequiredError } from "./pipeline.js";
+import { bannerText, failureTrack, noticeTrack, preparingTrack, withBanner } from "./status.js";
+import type { AutoSubPipeline } from "./pipeline.js";
 import type { StreamRegistry, UpstreamStreamAddon } from "./streams.js";
 
 export interface AppDependencies {
@@ -47,9 +35,9 @@ const UPSTREAM_TIMEOUT_MS = 25_000;
 
 const manifest = {
   id: "community.autosub",
-  version: "1.17.2",
+  version: "2.0.0",
   name: "AutoSub",
-  description: "Audio-validated, automatically synchronized subtitles with Arabic AI fallback and override",
+  description: "Audio-validated, automatically synchronized Arabic subtitles, AI-translated when no match exists",
   resources: [
     { name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] },
     { name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt"] },
@@ -65,8 +53,7 @@ function statusFor(error: unknown): number {
   if (error instanceof JobExpiredError) return 404;
   if (error instanceof JobTimeoutError) return 504;
   if (error instanceof HttpError) return error.status === 429 ? 429 : 502;
-  if (error instanceof TranslationRequiredError) return 422;
-  if (error instanceof Error && /No subtitle|Could not determine|no audio stream|Not enough audio/i.test(error.message)) return 422;
+  if (error instanceof Error && /No subtitle|Could not determine|no audio stream|Not enough audio|placeholder|too heavy to sample/i.test(error.message)) return 422;
   return 502;
 }
 
@@ -136,8 +123,8 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       upstream: upstream.enabled,
       audioAnalysis: config.audioAnalysisEnabled,
       providers: providers.map((provider) => provider.name),
-      translation: translationConfigured(config) && config.translationMode !== "off"
-        ? { provider: config.translation.provider, mode: config.translationMode, concurrency: config.translation.concurrency }
+      translation: translationConfigured(config)
+        ? { provider: config.translation.provider, model: config.translation.model, concurrency: config.translation.concurrency }
         : "disabled",
       languageDetectionFallback: config.deepgram.apiKey ? "deepgram" : "metadata-only",
       jobs: { tracked: jobs.size, running: jobs.running },
@@ -237,8 +224,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       // Start preparing before redirecting: the player will ask for the subtitle
       // list within seconds, and this is the only point where the exact release
       // is known.
-      const prewarm = parseSubtitleRequest(stream.type, stream.contentId, undefined, config.defaultLanguages);
-      for (const language of config.defaultLanguages) void jobs.startTracked(prewarm, stream, language);
+      jobs.start(parseSubtitleRequest(stream.type, stream.contentId, undefined, [TARGET_LANGUAGE]), stream, TARGET_LANGUAGE);
       response.setHeader("Cache-Control", "no-store");
       response.redirect(302, stream.url);
     } catch (error) {
@@ -246,91 +232,21 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     }
   });
 
-  interface SubtitleEntry {
-    id: string;
-    url: string;
-    lang: string;
-  }
-
   const fileUrl = (path: string): string => `${config.publicUrl}/${config.installToken}/${path}`;
 
   /**
-   * Stremio treats a changed subtitle id as another variant, even when its
-   * language and purpose are identical. Job ids are intentionally ephemeral,
-   * so exposing them here left a stale duplicate after an AutoSub restart.
-   * Keep the selector identity stable for this title/language/action; only the
-   * URL needs to follow the current live job.
+   * Stremio treats a changed subtitle id as another variant, so the id stays
+   * stable per title while the URL follows the current (ephemeral) job.
    */
-  const entryId = (request: SubtitleRequest, language: string, action: string): string =>
-    `autosub-${action}-${stableKey({
-      version: 1,
-      type: request.type,
-      contentId: request.contentId,
-      language,
-      action,
-    }).slice(0, 24)}`;
-
-  /**
-   * Builds the menu for one language.
-   *
-   * The first entry keeps the plain ISO code so Stremio's "preferred subtitle
-   * language" still auto-selects it. The protocol offers no field other than
-   * `lang` for a row label, so anything else has to look like a language —
-   * which is why there is at most one extra entry, and why it never describes
-   * work in progress: the player fetches this list once, when playback starts,
-   * and never again. A "preparing" label written then would still say
-   * "preparing" an hour later. Progress is reported by the subtitle file
-   * itself, which is generated at the moment it is requested.
-   */
-  async function entriesFor(request: SubtitleRequest, stream: StreamRecord, language: string): Promise<SubtitleEntry[]> {
-    const jobId = await jobs.startTracked(request, stream, language);
-    const entries: SubtitleEntry[] = [{
-      id: entryId(request, language, "main"),
-      url: fileUrl(`file/${jobId}.srt`),
-      lang: stremioLanguage(language),
-    }];
-    if (!config.menuEntries) return entries;
-
-    // Only state that cannot go stale earns a row: a finished result (a warm
-    // or cached play) and the always-valid "try another" action.
-    const snapshot = await jobs.snapshot(jobId, config.statusProbeMs);
-    if (snapshot?.state === "ready") {
-      entries.push({ id: entryId(request, language, "status"), url: fileUrl(`file/${jobId}.srt`), lang: resultLabel(snapshot.result) });
-    } else if (snapshot?.state === "failed") {
-      entries.push({
-        id: entryId(request, language, "status"),
-        url: fileUrl(`file/${jobId}.srt`),
-        lang: failedLabel(snapshot.error instanceof TranslationRequiredError && config.translationMode === "manual" && translationConfigured(config)),
-      });
-    }
-    // One row per attempt: each has its own URL, so a viewer can reject three
-    // subtitles in a row without leaving the player. Selecting any of them
-    // means the same thing — "not this one, give me the next".
-    for (let attempt = 1; attempt <= config.retryEntries; attempt += 1) {
-      entries.push({
-        id: entryId(request, language, `next-${attempt}`),
-        url: fileUrl(`next/${jobId}/${attempt}.srt`),
-        lang: retryLabel(language, attempt),
-      });
-    }
-    // Translation costs money per title, so in manual mode it is an explicit
-    // choice rather than something that happens on the viewer's behalf.
-    if (config.translationMode === "manual" && translationConfigured(config)) {
-      entries.push({
-        id: entryId(request, language, "translate"),
-        url: fileUrl(`translate/${jobId}.srt`),
-        lang: translateLabel(language),
-      });
-    }
-    return entries;
-  }
+  const entryId = (request: SubtitleRequest): string =>
+    `autosub-main-${stableKey({ version: 1, type: request.type, contentId: request.contentId, language: TARGET_LANGUAGE, action: "main" }).slice(0, 24)}`;
 
   function sendSubtitle(response: Response, result: CompletedSubtitle): void {
     const content = config.statusBanner
       ? serializeSrt(withBanner(parseSrt(result.content), bannerText(result)))
       : result.content;
-    // Never cached: what this URL returns changes when the viewer rejects a
-    // subtitle, and a stale copy would make "try another" look broken.
+    // Never cached: the same URL answers "still preparing" before it answers
+    // with the finished subtitle.
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-AutoSub-Confidence", String(result.confidence));
     response.setHeader("X-AutoSub-Provider", result.provider);
@@ -351,7 +267,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
    * of an error the viewer will never see.
    */
   function respondToFailure(response: Response, next: NextFunction, error: unknown, jobId: string): void {
-    const language = jobs.languageOf(jobId) || config.defaultLanguages[0];
+    const language = jobs.languageOf(jobId) || TARGET_LANGUAGE;
     if (!config.statusMessages) {
       next(error);
       return;
@@ -367,10 +283,6 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       ]), "expired");
       return;
     }
-    if (error instanceof TranslationRequiredError) {
-      sendNotice(response, translationOfferTrack(language), "translation-offered");
-      return;
-    }
     const reason = error instanceof Error ? error.message : "Unknown error";
     console.warn(`Subtitle request failed: ${reason}`);
     sendNotice(response, failureTrack(reason), "failed");
@@ -378,15 +290,17 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
 
   async function subtitleList(request: Request, response: Response, next: NextFunction, extra?: string): Promise<void> {
     try {
-      const parsed = parseSubtitleRequest(String(request.params.type), String(request.params.id), extra, config.defaultLanguages);
+      const parsed = parseSubtitleRequest(String(request.params.type), String(request.params.id), extra, [TARGET_LANGUAGE]);
       const stream = await registry.waitFor(parsed, config.streamWaitMs);
       response.setHeader("Cache-Control", "no-store");
       if (!stream) {
         response.json({ subtitles: [] });
         return;
       }
-      const subtitles = (await Promise.all(config.defaultLanguages.map((language) => entriesFor(parsed, stream, language)))).flat();
-      response.json({ subtitles });
+      // One row with the plain ISO code, so Stremio's preferred-language
+      // setting selects it automatically.
+      const jobId = jobs.start(parsed, stream, TARGET_LANGUAGE);
+      response.json({ subtitles: [{ id: entryId(parsed), url: fileUrl(`file/${jobId}.srt`), lang: stremioLanguage(TARGET_LANGUAGE) }] });
     } catch (error) {
       next(error);
     }
@@ -406,44 +320,6 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
     } catch (error) {
       respondToFailure(response, next, error, jobId);
     }
-  });
-
-  // Selecting one of these entries says "this one is wrong": the delivered
-  // subtitle is remembered as rejected and the next best candidate is prepared
-  // in its place. The attempt number only makes the URL unique.
-  async function serveNext(request: Request, response: Response, next: NextFunction): Promise<void> {
-    const jobId = String(request.params.jobId);
-    try {
-      const result = await jobs.retry(jobId, config.jobWaitMs);
-      if (result) {
-        sendSubtitle(response, result);
-        return;
-      }
-      if (!config.statusMessages) {
-        response.status(404).json({ error: "No other subtitle passed validation" });
-        return;
-      }
-      sendNotice(response, exhaustedTrack(jobs.languageOf(jobId) || config.defaultLanguages[0]), "exhausted");
-    } catch (error) {
-      respondToFailure(response, next, error, jobId);
-    }
-  }
-
-  // Explicitly asking for an AI translation of the trusted timing track.
-  app.get("/:token/translate/:jobId.srt", authorized, async (request, response, next) => {
-    const jobId = String(request.params.jobId);
-    try {
-      sendSubtitle(response, await jobs.translate(jobId, config.jobWaitMs));
-    } catch (error) {
-      respondToFailure(response, next, error, jobId);
-    }
-  });
-
-  app.get("/:token/next/:jobId.srt", authorized, (request, response, next) => {
-    void serveNext(request, response, next);
-  });
-  app.get("/:token/next/:jobId/:attempt.srt", authorized, (request, response, next) => {
-    void serveNext(request, response, next);
   });
 
   app.use((error: unknown, request: Request, response: Response, _next: NextFunction) => {

@@ -1,6 +1,6 @@
 # Translation
 
-Translation is normally the fallback of last resort and only runs when asked for (`TRANSLATION_MODE=manual`, the default). The subtitle menu also exposes an explicit `force AI translation` row. Selecting it always generates an AI version from a validated source-language timing track, even when AutoSub already found a working target-language subtitle. The forced and direct variants are cached separately, so the paid alternative never replaces the normal row. The cheapest translation is still the one that never happens, so use the override deliberately.
+Translation is the fallback of last resort, and it is automatic: when no Arabic subtitle passes validation, the best validated timing track is translated without the viewer doing anything. That track is the spoken-language subtitle when one matched the transcript; otherwise it is the other-language reference (normally English) that matched the speech activity — which is how a Japanese film with no Japanese subtitles still gets an Arabic one.
 
 A feature film is roughly 1,200–1,600 cues and 60–80k characters. That figure is what every option below should be judged against, and `/stats` reports it per run alongside the tokens actually charged.
 
@@ -43,15 +43,19 @@ TRANSLATION_CONCURRENCY=12
 TRANSLATION_TIMEOUT_MS=180000
 ```
 
-Reasoning models are slow enough to matter here. AutoSub uses verified 120-cue
-batches and runs up to twelve at once by default. The private Codex gateway was
-benchmarked at 95 successful requests per minute with twelve truly overlapping
-executions, so a typical film can be submitted in one or two waves. Other
-endpoints may support less: 429 backpressure automatically halves the active
-worker count and remembers the working limit without discarding completed paid
-batches. A long translation may still exceed `JOB_WAIT_MS`, so the first
-request returns the
-"still preparing" notice and the subtitle appears when the row is selected
+Reasoning models are slow enough to matter here. Batches are sized so the
+whole title goes out in one parallel wave — `ceil(cues / TRANSLATION_CONCURRENCY)`,
+between 40 and 120 cues — because a reasoning model's latency grows with the
+length of its answer. Each batch also receives the four lines before it as
+read-only context, so a scene split across two batches keeps its pronouns and
+register. `TRANSLATION_REASONING_EFFORT` (default `medium`) is sent as
+`reasoning_effort`. 429 backpressure automatically halves the active worker
+count and remembers the working limit without discarding completed paid
+batches; a 429 whose `Retry-After` is longer than 30 seconds (an exhausted
+subscription) fails the title immediately instead of retrying.
+
+A long translation may still exceed `JOB_WAIT_MS`, so the first request returns
+the "still preparing" notice and the subtitle appears when `Arabic` is selected
 again. Set `TRANSLATION_CONCURRENCY` to what the endpoint allows (1–12).
 
 Language-model batches are intentionally moderate rather than enormous: a
@@ -60,6 +64,28 @@ the entire title. Every complete result is also checked for cue identity and
 for a model that mostly echoed the source. Arabic prompts explicitly request
 concise, natural Modern Standard Arabic with consistent gender, names, tone,
 and scene context rather than literal line-by-line wording.
+
+### The private Codex gateway
+
+The production instance translates with `gpt-6-luna` at `medium` effort through
+the Codex subscription gateway on the A1 host, reached over Tailscale rather
+than through Cloudflare:
+
+```dotenv
+TRANSLATION_PROVIDER=openai
+TRANSLATION_BASE_URL=http://a1.tail70e8a6.ts.net:8792/v1
+TRANSLATION_MODEL=gpt-6-luna
+TRANSLATION_REASONING_EFFORT=medium
+TRANSLATION_TIMEOUT_MS=420000
+DNS_SERVER=100.100.100.100
+```
+
+Cloudflare's proxy closes any request whose response has not started within
+100 seconds, and a medium-effort batch can take longer than that, so the public
+`openai.jweaker.xyz` hostname is not suitable for this caller. The tailnet name
+needs the container to use Tailscale's resolver, hence `DNS_SERVER`. The
+gateway's own `COMPAT_REQUEST_TIMEOUT_MS` must stay above
+`TRANSLATION_TIMEOUT_MS`.
 
 A model running on your own machine, where the only cost is electricity:
 
@@ -102,7 +128,7 @@ Watch `/stats` after a translation:
 
 ## Switching engines
 
-The cache key includes the provider, model, and whether AI was explicitly forced. Direct and forced subtitles therefore coexist for the same release, while choosing the force row again reuses the already generated result. Nothing needs clearing by hand.
+The cache key includes the provider and model, so switching engines regenerates translations on the next play. Nothing needs clearing by hand.
 
 ## What never changes
 

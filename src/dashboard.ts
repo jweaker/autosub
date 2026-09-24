@@ -82,6 +82,14 @@ export function renderDashboard(data: DashboardData): string {
     const reason = run.failure || "No failure detail recorded";
     failureGroups.set(reason, (failureGroups.get(reason) || 0) + 1);
   }
+  // A provider that is down fails no run by itself; it just quietly shrinks
+  // every search, so it is listed with the causes rather than hidden in logs.
+  for (const run of runs) {
+    for (const [provider, error] of Object.entries(run.providerErrors || {})) {
+      const reason = `${provider} search failed: ${error}`;
+      failureGroups.set(reason, (failureGroups.get(reason) || 0) + 1);
+    }
+  }
   const failureRows = [...failureGroups]
     .sort((left, right) => right[1] - left[1])
     .map(([reason, count]) => `<li><strong>${number(count)}</strong><span>${escapeHtml(reason)}</span></li>`)
@@ -146,7 +154,7 @@ export function renderDashboard(data: DashboardData): string {
     <div class="grid">
       <section class="panel">
         <h2>AI translation usage</h2>
-        <p>${escapeHtml(config.translation.provider)} / ${escapeHtml(config.translation.model)}, up to ${number(config.translation.concurrency)} parallel workers with automatic backpressure, ${escapeHtml(config.translationMode)} mode.</p>
+        <p>${escapeHtml(config.translation.provider)} / ${escapeHtml(config.translation.model)}, up to ${number(config.translation.concurrency)} parallel workers with automatic backpressure, used automatically when no Arabic subtitle matches.</p>
         <div class="facts">
           <div class="fact"><span>Generated titles</span><strong>${number(translated.length)}</strong><small>${number(translatedCues)} cues</small></div>
           <div class="fact"><span>Translation time</span><strong>${translationMs ? duration(translationMs) : "0 s"}</strong><small>Model stage total</small></div>

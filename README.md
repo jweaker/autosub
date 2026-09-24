@@ -2,7 +2,7 @@
 
 A self-hosted Stremio addon that delivers **one subtitle that is actually in sync**, verified against the audio of the exact release you are playing.
 
-Subtitle addons normally hand the player a list of guesses named after releases they may or may not match. AutoSub does the opposite: it listens to a few seconds of the film you just started, checks candidate subtitles against what is actually being said, corrects constant offset and frame-rate drift, and returns a single track — or nothing at all, if nothing passes. Arabic is the default target language; when no Arabic subtitle survives validation, a validated original-language track is translated with Gemini while its verified timestamps are left untouched.
+Subtitle addons normally hand the player a list of guesses named after releases they may or may not match. AutoSub does the opposite: it listens to a few seconds of the film you just started, checks candidate subtitles against what is actually being said, corrects constant offset and frame-rate drift, and returns a single track — or nothing at all, if nothing passes. It delivers Arabic, and only Arabic: when no Arabic subtitle survives validation, a validated timing track is translated by an AI model automatically, while its verified timestamps are left untouched.
 
 Built to run on a Raspberry Pi 4 next to a Real-Debrid account, exposed through a Cloudflare Tunnel.
 
@@ -31,26 +31,11 @@ Stremio ──► AutoSub ──► your configured Torrentio/debrid addon
 
 ## What you see while watching
 
-Stremio gives an addon no way to show a spinner, so AutoSub reports itself through the two channels a player always renders: the subtitle menu and the subtitles themselves.
+One row in the subtitle menu: `Arabic`. Stremio's preferred-language setting selects it on its own, so there is nothing to choose. Behind that row AutoSub finds the best Arabic subtitle for the exact release, and when none fits it generates one with AI — the viewer never has to ask.
 
-| In the subtitle menu | Meaning |
-|---|---|
-| `Arabic` | The normal entry. Your preferred-language setting still auto-selects it. |
-| `Arabic - Next` | Select this if the subtitle is wrong. |
-| `Arabic - Next 2 / 3` | Same thing again, for a second and third rejection. |
-| `Arabic - AI (paid)` | Force a separately cached AI translation. |
-| `OpenSubs 81%` | A warm direct result, with provider and confidence. |
-| `AI English 74%` | A warm AI result, with source language and confidence. |
+Stremio gives an addon no way to show a spinner, so AutoSub reports itself through the one channel a player always renders: the subtitle itself. The delivered file opens with a short line naming its origin — `[AutoSub] opensubtitles subtitle - 81% match` — that clears after a few seconds. If preparation is still running past `JOB_WAIT_MS` (an AI translation can take a couple of minutes), or nothing could be matched at all, a readable message appears on screen instead of silence; select `Arabic` again a minute later to load the finished subtitle.
 
-The protocol gives an addon three fields per row — `id`, `url`, `lang` — and the player renders `lang`. So anything extra has to look like a language, which is why there is only one always-present extra row, and why **progress is never shown there**: the list is fetched once, when playback starts, so a "preparing" label written then would still say "preparing" an hour later.
-
-Progress lives in the subtitle instead, which is generated when it is requested and so is always current. The delivered file opens with one short line naming its origin — `[AutoSub] opensubtitles subtitle - 81% match` — that clears after a few seconds. If preparation is still running past `JOB_WAIT_MS`, or nothing passed validation, you get a readable message on screen instead of silence.
-
-**"Try another" marks the current subtitle as bad**, remembers that permanently for this release, and returns the next best candidate in the same response — the new subtitle simply appears, with no need to switch back to the plain language row. The rejection survives restarts, so the same file is never handed back, and the audio analysis is reused, which makes each further attempt take seconds rather than another full run. When nothing is left, it says so.
-
-The numbered rows exist because a player will not re-request a subtitle it has already loaded, so one row could only ever be used once per playback. Three rows mean three rejections without leaving the player; `RETRY_ENTRIES` sets how many (0 for none).
-
-Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` or `STATUS_MESSAGES=false` to get the plain single-entry behaviour back.
+Set `STATUS_BANNER=false` or `STATUS_MESSAGES=false` to turn either behaviour off.
 
 ## How it works
 
@@ -60,10 +45,10 @@ Every part of this is optional: set `MENU_ENTRIES=false`, `STATUS_BANNER=false` 
 4. **Speech timeline.** WebRTC VAD builds a local speech-activity timeline; Deepgram adds word-level timestamps. Quiet or failed samples are selectively replaced, and a mislabelled audio track falls back to language detection.
 5. **Candidate search.** OpenSubtitles, SubDL, and SubSource are searched concurrently and the results ranked by hash match, release-name similarity, source, group, edition, and frame rate.
 6. **Validation.** Candidates are downloaded in waves — the best entry from each provider at a time — and scored against the speech timeline. A global model corrects constant delay and constrained frame-rate drift (50 ms / 0.01% precision). Anything that only fits in places is rejected.
-7. **Target language.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. A source track that no candidate can align to is discarded and the next best one tried, because a subtitle cut for a different edit can match the audio and still be a useless reference.
+7. **Arabic.** An Arabic candidate is accepted only when its cue events match the trusted track across the whole title. A source track that no candidate can align to is discarded and the next best one tried, because a subtitle cut for a different edit can match the audio and still be a useless reference.
 8. **When the spoken language has nothing.** Some films — anime especially — have a handful of subtitles in their original language and hundreds in English. Speech activity is language-independent, so an English subtitle can be validated against the audio and then vouch for the Arabic one across the whole title. Failing even that, the Arabic track is checked against speech activity directly. Both answer to a higher confidence bar than a transcript match.
-9. **Translation, only if asked.** The `force AI translation` menu row is a real override: it validates a source-language timing track and translates it even when a working Arabic subtitle already exists. Direct and forced results have separate cache entries, so choosing AI never replaces the normal row. When no direct candidate matches, AutoSub points the viewer to the same row; set `TRANSLATION_MODE=auto` to translate that fallback unprompted, or `off` to disable it. Timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. See [docs/translation.md](docs/translation.md) for choosing an engine.
-10. **Caching.** The result is stored by release fingerprint, rejection set, and translation-engine version, so repeat plays are instant.
+9. **Translation when nothing matches.** If no Arabic subtitle fits, the best validated timing track — the spoken-language one when it exists, otherwise the other-language reference from step 8 — is translated automatically. Timestamps never leave this process, and an answer that drops or reorders cues is rejected rather than applied. See [docs/translation.md](docs/translation.md) for choosing an engine.
+10. **Caching.** The result is stored by release fingerprint and translation-engine version, so repeat plays are instant.
 
 If nothing passes, AutoSub says so rather than serving a subtitle that drifts. See [docs/architecture.md](docs/architecture.md) for the full design and [docs/tuning.md](docs/tuning.md) for the confidence model.
 
@@ -74,7 +59,7 @@ If nothing passes, AutoSub says so rather than serving a subtitle that drifts. S
 | TV → debrid | The video itself, directly after an HTTP 302 redirect |
 | AutoSub → debrid | A few seconds of mono audio per title, plus replacements when a sample has no dialogue |
 | AutoSub → subtitle providers | IMDb/release identifiers and subtitle downloads |
-| AutoSub → Gemini | Validated original-language subtitle text only, never timestamps |
+| AutoSub → translation engine | Validated subtitle text only, never timestamps |
 | AutoSub → Deepgram | The mono audio samples |
 | Tunnel → AutoSub | Stremio addon requests and finished subtitle files, never video bytes |
 
@@ -85,7 +70,7 @@ Every addon URL is prefixed with a private `INSTALL_TOKEN`. Treat the manifest U
 - Node.js 20.11+, or Docker with the Compose plugin (the image bundles Node, FFmpeg, Python and WebRTC VAD, and is multi-architecture)
 - A public HTTPS address — a Cloudflare Tunnel is the documented path
 - A configured upstream stream addon URL (for example Torrentio with Real-Debrid)
-- API keys for at least one subtitle provider; TMDB, Deepgram and Gemini are strongly recommended
+- API keys for at least one subtitle provider; TMDB, Deepgram and a translation engine are strongly recommended
 
 ## Install
 
@@ -103,7 +88,7 @@ docker compose up -d
 curl -fsS http://127.0.0.1:7000/healthz
 ```
 
-The health response should report `upstream: true`, your providers, `audioAnalysis: true` and `translation: gemini`.
+The health response should report `upstream: true`, your providers, `audioAnalysis: true` and your translation engine.
 
 Point a Cloudflare Tunnel public hostname at `http://localhost:7000`, set `PUBLIC_URL` to that hostname, then open:
 
@@ -131,20 +116,18 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `PUBLIC_URL` | `http://127.0.0.1:PORT` | Public HTTPS base URL of this instance |
 | `INSTALL_TOKEN` | *(unset — refuses to be secure)* | Secret path prefix for every addon URL |
 | `UPSTREAM_ADDON_URL` | — | Configured stream addon manifest to wrap |
-| `DEFAULT_LANGUAGES` | `ar` | Subtitle languages to deliver |
 | `MINIMUM_CONFIDENCE` | `58` | Reject anything scoring lower |
 | `FALLBACK_REFERENCE_LANGUAGES` | `en` | Languages that may carry timing when the spoken language has no usable subtitle |
 | `CANDIDATE_LIMIT` | `10` | Candidates downloaded and validated per language |
 | `JOB_WAIT_MS` | `120000` | How long a subtitle request waits for preparation |
 | `CACHE_TTL_DAYS` | `30` | Age at which cached subtitles are swept |
-| `MENU_ENTRIES` | `true` | Add the "try another" rows, and a result row on warm plays |
-| `RETRY_ENTRIES` | `3` | How many "try another" rows, each usable once per playback |
 | `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
-| `TRANSLATION_MODE` | `manual` | `manual` offers translation in the menu, `auto` runs it unprompted, `off` disables it |
 | `TRANSLATION_PROVIDER` | `gemini` | `gemini`, `openai` (any chat-completions endpoint), `deepl`, or `libretranslate` |
+| `TRANSLATION_REASONING_EFFORT` | `medium` | `reasoning_effort` sent to an `openai` endpoint |
 | `TRANSLATION_CONCURRENCY` | `12` | Maximum independent AI batches; automatically reduced under endpoint backpressure (1–12) |
 | `STATUS_BANNER` | `true` | Open each subtitle with a line naming its origin |
 | `STATUS_MESSAGES` | `true` | Deliver progress and failures as a readable track |
+| `DNS_SERVER` | `1.1.1.1` | Container resolver (Compose only); use one that resolves every provider hostname |
 
 Invalid or out-of-range values are clamped rather than trusted, and the server prints a warning for each risky setting at startup (unset token, non-HTTPS public URL, missing upstream, disabled analysis).
 

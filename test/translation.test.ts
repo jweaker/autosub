@@ -3,7 +3,7 @@ import { loadConfig } from "../src/config.js";
 import type { SubtitleCue } from "../src/domain.js";
 import { HttpError } from "../src/http.js";
 import { createTranslator, DeepLTranslator, LibreTranslateTranslator, OpenAiCompatibleTranslator } from "../src/translation/index.js";
-import { assertTranslationChanged, batchCues, runBatchResiliently, runBatches } from "../src/translation/types.js";
+import { assertTranslationChanged, batchCues, batchSizeFor, runBatchResiliently, runBatches } from "../src/translation/types.js";
 
 const cues: SubtitleCue[] = Array.from({ length: 5 }, (_, index) => ({
   id: index + 1,
@@ -145,6 +145,35 @@ describe("OpenAI-compatible backend", () => {
     const result = await new OpenAiCompatibleTranslator(settings).translate(many, "en", "ar");
     expect(result).toHaveLength(121);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("reasoning-model batches", () => {
+  it("spreads a short title across every worker and carries context between batches", async () => {
+    const episode = Array.from({ length: 240 }, (_, index) => ({ ...cues[0], id: index + 1, text: `episode line ${index + 1}` }));
+    const bodies: Array<{ reasoning_effort?: string; messages: Array<{ content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { reasoning_effort?: string; messages: Array<{ content: string }> };
+      bodies.push(body);
+      const sent = JSON.parse(body.messages.at(-1)?.content.split("Cues: ")[1].split("\nRespond")[0] || "[]") as Array<{ id: number }>;
+      return jsonResponse({ choices: [{ message: { content: JSON.stringify(sent.map((cue) => ({ id: cue.id, text: `مترجم ${cue.id}` }))) } }] });
+    }));
+
+    const result = await new OpenAiCompatibleTranslator({ ...settings, concurrency: 12, reasoningEffort: "medium" }).translate(episode, "en", "ar");
+    expect(result).toHaveLength(240);
+    // 240 cues over 12 workers would be 20 each; the floor keeps batches
+    // large enough to amortise the fixed per-request prompt.
+    expect(bodies).toHaveLength(6);
+    expect(bodies.every((body) => body.reasoning_effort === "medium")).toBe(true);
+    const later = bodies.find((body) => body.messages.at(-1)?.content.includes("\"episode line 41\""));
+    expect(later?.messages.at(-1)?.content).toContain("Preceding lines, for context only");
+    expect(later?.messages.at(-1)?.content).toContain("episode line 40");
+  });
+
+  it("sizes batches between the per-request floor and the film ceiling", () => {
+    expect(batchSizeFor(1_400, 12, 40, 120)).toBe(117);
+    expect(batchSizeFor(3_000, 12, 40, 120)).toBe(120);
+    expect(batchSizeFor(100, 12, 40, 120)).toBe(40);
   });
 });
 

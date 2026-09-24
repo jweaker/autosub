@@ -15,8 +15,6 @@
 | `GET /:token/play/:playId` | Records the release, starts preparation, 302s to the debrid URL |
 | `GET /:token/subtitles/:type/:id[/:extra].json` | Subtitle list for the release being played |
 | `GET /:token/file/:jobId.srt` | The finished subtitle |
-| `GET /:token/next/:jobId[/:attempt].srt` | Rejects the current subtitle and serves the next candidate |
-| `GET /:token/translate/:jobId.srt` | Forces AI translation of the trusted timing track on request |
 
 Anything with a wrong token returns 404, compared in constant time.
 
@@ -30,7 +28,7 @@ $PUBLIC_URL/$INSTALL_TOKEN/dashboard
 
 It summarizes recent success and failure rates, stage latency, AI prompt and response tokens, source characters, Deepgram requests and submitted audio, probe reuse, active jobs, failure reasons, and cache size. The latest runs remain available as JSON at `/:token/stats` for automation.
 
-Cache deletion is deliberately selective. Filter by title, release, or provider, select entries, acknowledge that they will be regenerated, and submit. The form carries a process-local anti-forgery token and accepts only validated cache keys; it cannot delete the registry, rejection history, configuration, or arbitrary files.
+Cache deletion is deliberately selective. Filter by title, release, or provider, select entries, acknowledge that they will be regenerated, and submit. The form carries a process-local anti-forgery token and accepts only validated cache keys; it cannot delete the registry, run history, configuration, or arbitrary files.
 
 ## Health
 
@@ -44,14 +42,14 @@ curl -fsS http://127.0.0.1:7000/healthz | jq
   "upstream": true,
   "audioAnalysis": true,
   "providers": ["opensubtitles", "subdl", "subsource"],
-  "translation": "gemini",
+  "translation": { "provider": "openai", "model": "gpt-6-luna", "concurrency": 12 },
   "languageDetectionFallback": "deepgram",
   "jobs": { "tracked": 3, "running": 1 },
   "uptimeSeconds": 84213
 }
 ```
 
-A provider missing from `providers` has no API key configured. `translation: "disabled"` means no Gemini key, so a title with no direct target-language match will simply fail.
+A provider missing from `providers` has no API key configured. `translation: "disabled"` means the translation engine is not configured, so a title with no Arabic match will simply fail.
 
 ## Where the time goes
 
@@ -72,17 +70,17 @@ curl -fsS "$PUBLIC_URL/$INSTALL_TOKEN/stats" | jq '.runs[0]'
 }
 ```
 
-Every delivered run carries `speechErrorMs`: how far the finished subtitle sits from the speech in the sampled audio, measured after every other decision was made. A well-timed track is within a couple of hundred milliseconds; anything past 1200 ms is refused outright, whichever route produced it. Failed runs retain `failure`, `excluded`, and an `evaluations` object with discovered/attempted/decoded/passed counts, the best confidence seen, and cue-cleanup totals. This distinguishes "no provider result" from "ten real files were decoded but none reached 58" without reconstructing expired logs. Translated runs also carry a `translation` block with cue and token counts. New cold runs carry an `audio` block with sampled seconds, transcripts, exact Deepgram requests and submitted seconds, and whether the audio probe was reused. `outcome` is `cached`, `direct`, `translated` or `failed`.
+Every delivered run carries `speechErrorMs`: how far the finished subtitle sits from the speech in the sampled audio, measured after every other decision was made. A well-timed track is within a couple of hundred milliseconds; anything past 1200 ms is refused outright, whichever route produced it. Failed runs retain `failure`, `providerErrors` (any provider whose search failed outright), and an `evaluations` object with discovered/attempted/decoded/passed counts, the best confidence seen, and cue-cleanup totals. This distinguishes "no provider result" from "ten real files were decoded but none reached 58" without reconstructing expired logs. Translated runs also carry a `translation` block with cue and token counts. New cold runs carry an `audio` block with sampled seconds, transcripts, exact Deepgram requests and submitted seconds, and whether the audio probe was reused. `outcome` is `cached`, `direct`, `translated` or `failed`.
 
 ## Status codes
 
-With `STATUS_MESSAGES=true` (the default), the subtitle routes answer 200 with a readable message track instead of the error codes below, and set `X-AutoSub-State` to `preparing`, `failed`, `expired` or `exhausted`. The codes apply when that is turned off.
+With `STATUS_MESSAGES=true` (the default), the subtitle routes answer 200 with a readable message track instead of the error codes below, and set `X-AutoSub-State` to `preparing`, `failed` or `expired`. The codes apply when that is turned off.
 
 | Code | Meaning | What to do |
 |---|---|---|
 | 404 | Bad token, or a job that has aged out | Reopen the title in Stremio |
 | 410 | Play link older than `STREAM_TTL_HOURS` | Reopen the title |
-| 422 | Nothing matched the audio | Expected sometimes; see [tuning](tuning.md) |
+| 422 | Nothing matched the audio, or the debrid service served a placeholder clip | Try another stream; see [tuning](tuning.md) |
 | 429 | Rate limit | Raise `RATE_LIMIT_PER_MINUTE` if it is your own traffic |
 | 502 | Upstream addon or provider fault | Check logs and the provider's status |
 | 504 | Still preparing after `JOB_WAIT_MS` | Work continues; the retry usually hits the cache |
@@ -104,30 +102,22 @@ Then one of:
 
 ```
 Direct ar subtitle selected from subdl; ...
-No direct ar timing match; translating trusted en timing with gemini-3.5-flash
+No ar timing match; translating trusted en timing with openai (gpt-6-luna)
 ```
 
-A viewer pressing "try another" logs the rejection and the follow-up attempt:
-
-```
-Rejected subdl:41283 for tt1234567 (ar); trying the next candidate
-Preparing ar for tt1234567 while skipping 1 rejected subtitle(s)
-```
-
-Warnings that are normal in small numbers: a provider search failing (the others continue), a candidate failing to download or parse (the next wave runs), `WebRTC VAD unavailable` (the energy fallback is in use — worth fixing, but not fatal).
+Warnings that are normal in small numbers: a provider search failing (the others continue — but the same provider failing on every run is an outage, and the dashboard lists it under failure causes), a candidate failing to download or parse (the next wave runs), `WebRTC VAD unavailable` (the energy fallback is in use — worth fixing, but not fatal).
 
 ## Data and housekeeping
 
 ```
 data/streams.json      play-link registry
-data/rejections.json   subtitles the viewer marked as wrong, per release
 data/runs.json         the last 25 run summaries served by /stats
 data/subtitles/        cached results
 ```
 
 All three are safe to delete while the service is stopped: the registry rebuilds as titles are browsed, and the cache re-derives on the next play. Expired registry records and cached subtitles older than `CACHE_TTL_DAYS` are swept hourly and at startup.
 
-To force a re-run for one title, use the dashboard's selective cache controls. Deleting `data/rejections.json` gives every previously rejected subtitle another chance, but this is intentionally not exposed as a dashboard action.
+To force a re-run for one title, use the dashboard's selective cache controls.
 
 ## Restarting and updating
 

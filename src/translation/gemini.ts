@@ -1,7 +1,7 @@
 import type { SubtitleCue } from "../domain.js";
 import { isTransient, requestJson } from "../http.js";
 import { collectRows, parseRows, translationPrompt } from "./prompt.js";
-import { assertTranslationChanged, batchCues, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
+import { assertTranslationChanged, batchCues, contextFor, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
 export interface GeminiSettings {
   apiKey?: string;
@@ -38,7 +38,7 @@ export class GeminiTranslator implements Translator {
     return Boolean(this.settings.apiKey);
   }
 
-  private async translateBatch(batch: SubtitleCue[], source: string, target: string, usage: TranslationUsage, signal?: AbortSignal): Promise<Map<number, string>> {
+  private async translateBatch(batch: SubtitleCue[], source: string, target: string, context: string[], usage: TranslationUsage, signal?: AbortSignal): Promise<Map<number, string>> {
     const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.settings.model)}:generateContent`);
     let lastError: unknown;
 
@@ -53,7 +53,7 @@ export class GeminiTranslator implements Translator {
           timeoutMs: this.settings.timeoutMs ?? BATCH_TIMEOUT_MS,
           label: "Gemini translation",
           body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: translationPrompt(batch, source, target) }] }],
+            contents: [{ role: "user", parts: [{ text: translationPrompt(batch, source, target, context) }] }],
             generationConfig: {
               temperature: 0.15,
               responseMimeType: "application/json",
@@ -90,9 +90,10 @@ export class GeminiTranslator implements Translator {
     if (!this.enabled) throw new Error("No Gemini API key is configured for subtitle translation");
     const usage = { characters: countCharacters(cues), promptTokens: 0, responseTokens: 0 };
     const batches = batchCues(cues, MAX_CUES_PER_BATCH, MAX_CHARACTERS_PER_BATCH);
+    const context = contextFor(cues);
     const translated = await runBatches(batches, this.effectiveConcurrency, (batch) => runBatchResiliently(
       batch,
-      (part) => this.translateBatch(part, source, target, usage, signal),
+      (part) => this.translateBatch(part, source, target, context(part), usage, signal),
     ), {
       onConcurrencyReduced: (concurrency) => {
         this.effectiveConcurrency = Math.min(this.effectiveConcurrency, concurrency);

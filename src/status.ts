@@ -8,63 +8,13 @@ const BANNER_MINIMUM_MS = 1_500;
 const NOTICE_INTERVAL_MS = 30_000;
 const NOTICE_LENGTH_MS = 5_000;
 const NOTICE_DEFAULT_DURATION_MS = 3 * 60 * 60 * 1000;
-const MENU_LABEL_MAX_LENGTH = 18;
-
-function menuLabel(head: string, suffix: string): string {
-  return `${head.slice(0, Math.max(0, MENU_LABEL_MAX_LENGTH - suffix.length)).trimEnd()}${suffix}`;
-}
-
-/** Labels stay short and ASCII because TV subtitle menus are narrow. */
-function providerName(provider: string): string {
-  const known: Record<string, string> = {
-    opensubtitles: "OpenSubs",
-    subdl: "SubDL",
-    subsource: "SubSource",
-  };
-  return known[provider.toLowerCase()] || provider;
-}
-
-export function resultLabel(result: CompletedSubtitle): string {
-  return result.translated
-    ? menuLabel(`AI ${languageName(result.sourceLanguage || "")}`, ` ${result.confidence}%`)
-    : menuLabel(providerName(result.provider), ` ${result.confidence}%`);
-}
-
-export function failedLabel(translationAvailable = false): string {
-  return translationAvailable
-    ? "No match - AI"
-    : "No subtitle match";
-}
-
-/**
- * Reads as a language row because the protocol has no other place to put it,
- * so it names the language first and the action second.
- *
- * Attempts are numbered because each one is a separate row with its own URL:
- * a player will not re-request a track it already has, so a single row could
- * only ever be used once per playback.
- */
-export function retryLabel(language: string, attempt = 1): string {
-  return menuLabel(languageName(language), ` - Next${attempt > 1 ? ` ${attempt}` : ""}`);
-}
-
-export function translateLabel(language: string): string {
-  return menuLabel(languageName(language), " - AI (paid)");
-}
-
-export function translationOfferTrack(language: string): string {
-  return noticeTrack([
-    `[AutoSub] No ${languageName(language)} subtitle matched this release.`,
-    `Pick "${translateLabel(language)}" in the subtitle menu to have one translated.`,
-  ]);
-}
 
 /** One-line summary of what was delivered, shown briefly at the start of playback. */
 export function bannerText(result: CompletedSubtitle): string {
   const origin = result.translated
     ? `AI translation from ${languageName(result.sourceLanguage || "")}`
     : `${result.provider} subtitle`;
-  return `[AutoSub] ${origin} - ${result.confidence}% match. Wrong one? Pick "Next" in the subtitle menu.`;
+  return `[AutoSub] ${origin} - ${result.confidence}% match`;
 }
 
 /**
@@ -100,7 +50,7 @@ export function noticeTrack(lines: string[], durationMs = NOTICE_DEFAULT_DURATIO
 export function preparingTrack(language: string): string {
   return noticeTrack([
     `[AutoSub] Still preparing the ${languageName(language)} subtitle.`,
-    "Reselect it from the subtitle menu in a moment.",
+    "Select it again from the subtitle menu in a minute.",
   ]);
 }
 
@@ -109,12 +59,5 @@ export function failureTrack(reason: string): string {
   return noticeTrack([
     "[AutoSub] No subtitle passed audio validation for this release.",
     concise,
-  ]);
-}
-
-export function exhaustedTrack(language: string): string {
-  return noticeTrack([
-    `[AutoSub] No other ${languageName(language)} subtitle passed validation.`,
-    "The previous one was kept as the best available match.",
   ]);
 }

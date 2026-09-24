@@ -1,8 +1,8 @@
 {
   "name": "autosub",
-  "version": "1.17.2",
+  "version": "2.0.0",
   "private": true,
-  "description": "Audio-validated, automatically synchronized subtitles for Stremio, Arabic-first with AI translation fallback and override",
+  "description": "Audio-validated, automatically synchronized Arabic subtitles for Stremio, AI-translated when no match exists",
   "license": "MIT",
   "type": "module",
   "engines": {

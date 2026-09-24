@@ -51,6 +51,26 @@ export function batchCues(cues: SubtitleCue[], maxCues: number, maxCharacters: n
   return batches;
 }
 
+/**
+ * Batch size that lets the whole title go out in one parallel wave.
+ *
+ * A reasoning model's latency grows with the length of its answer, so a
+ * 600-cue episode split into twelve 50-cue batches finishes in about half the
+ * time of five 120-cue ones, for the same tokens.
+ */
+export function batchSizeFor(total: number, concurrency: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, Math.ceil(total / Math.max(1, concurrency))));
+}
+
+/** The few lines before a batch, so a split scene keeps its pronouns and register. */
+export function contextFor(cues: SubtitleCue[], count = 4): (batch: SubtitleCue[]) => string[] {
+  const position = new Map(cues.map((cue, index) => [cue.id, index]));
+  return (batch) => {
+    const index = position.get(batch[0]?.id) ?? 0;
+    return cues.slice(Math.max(0, index - count), index).map((cue) => cue.text);
+  };
+}
+
 export interface BatchRunOptions {
   /** Number of scheduler-level attempts for a batch after transport retries. */
   attempts?: number;
