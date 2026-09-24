@@ -10,7 +10,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 compose() {
-  if docker compose version >/dev/null 2>&1; then
+  # `docker compose version` succeeds without daemon access; `docker info` does not.
+  if docker info >/dev/null 2>&1; then
     docker compose "$@"
   else
     sudo docker compose "$@"
