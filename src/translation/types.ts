@@ -1,3 +1,5 @@
+import { setTimeout as wait } from "node:timers/promises";
+import { TranslationResponseError } from "./prompt.js";
 import type { SubtitleCue } from "../domain.js";
 import { HttpError, isTransient } from "../http.js";
 
@@ -72,6 +74,7 @@ export function contextFor(cues: SubtitleCue[], count = 4): (batch: SubtitleCue[
 }
 
 export interface BatchRunOptions {
+  signal?: AbortSignal;
   /** Number of scheduler-level attempts for a batch after transport retries. */
   attempts?: number;
   /** Initial pause after endpoint backpressure. Primarily shortened in tests. */
@@ -85,7 +88,6 @@ interface PendingBatch {
   attempts: number;
 }
 
-const wait = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 /**
  * Runs independent batches concurrently while adapting to endpoint pressure.
@@ -108,11 +110,13 @@ export async function runBatches(
   let pending: PendingBatch[] = batches.map((batch) => ({ batch, attempts: 0 }));
 
   while (pending.length) {
+    options.signal?.throwIfAborted();
     let next = 0;
     let halted = false;
     const failures: Array<{ item: PendingBatch; error: unknown }> = [];
     const worker = async (): Promise<void> => {
       while (!halted && next < pending.length) {
+        options.signal?.throwIfAborted();
         const item = pending[next++];
         try {
           for (const [id, text] of await work(item.batch)) translated.set(id, text);
@@ -124,6 +128,7 @@ export async function runBatches(
     };
     await Promise.all(Array.from({ length: Math.min(limit, pending.length) }, worker));
 
+    options.signal?.throwIfAborted();
     const nonTransient = failures.find(({ error }) => !isTransient(error));
     if (nonTransient) throw nonTransient.error;
     if (!failures.length) {
@@ -146,7 +151,7 @@ export async function runBatches(
     }
     const requested = Math.max(0, ...retried.map(({ error }) => error instanceof HttpError ? error.retryAfterMs || 0 : 0));
     const round = Math.max(...retried.map(({ item }) => item.attempts));
-    await wait(requested || Math.min(30_000, retryDelayMs * 2 ** (round - 1)));
+    await wait(requested || Math.min(30_000, retryDelayMs * 2 ** (round - 1)), undefined, { signal: options.signal });
   }
   return translated;
 }
@@ -167,7 +172,7 @@ export async function runBatchResiliently(
   } catch (error) {
     // Transport and capacity failures do not become more recoverable when the
     // payload is split. Let runBatches reduce pressure and retry the same work.
-    if (isTransient(error)) throw error;
+    if (!(error instanceof TranslationResponseError)) throw error;
     if (batch.length <= minimumSplitSize) throw error;
     const middle = Math.ceil(batch.length / 2);
     const left = await runBatchResiliently(batch.slice(0, middle), work, minimumSplitSize);

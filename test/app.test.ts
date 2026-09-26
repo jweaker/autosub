@@ -1,3 +1,4 @@
+import { PreparationError } from "../src/errors.js";
 import type { AddressInfo } from "node:net";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -139,7 +140,7 @@ describe("addon HTTP surface", () => {
 
   it("keeps the selector id stable when a failed job is recreated", async () => {
     await start(async () => {
-      throw new Error("No subtitle in en matched the transcribed audio");
+      throw new PreparationError("no-match", "No subtitle in en matched the transcribed audio");
     });
     await playStream();
 
@@ -153,7 +154,7 @@ describe("addon HTTP surface", () => {
 
   it("turns a failed preparation into a readable message", async () => {
     await start(async () => {
-      throw new Error("No subtitle in en matched the transcribed audio");
+      throw new PreparationError("no-match", "No subtitle in en matched the transcribed audio");
     });
     await playStream();
     const [main] = await listSubtitles();
@@ -169,7 +170,7 @@ describe("addon HTTP surface", () => {
 
   it("returns a real error instead of a message track when notices are disabled", async () => {
     await start(async () => {
-      throw new Error("No subtitle in en matched the transcribed audio");
+      throw new PreparationError("no-match", "No subtitle in en matched the transcribed audio");
     }, { STATUS_MESSAGES: "false" });
     await playStream();
     const [main] = await listSubtitles();
@@ -230,4 +231,18 @@ describe("addon HTTP surface", () => {
     expect(await response.json()).toEqual({ subtitles: [] });
   });
 
+});
+
+it("redacts private paths and media URLs from failures", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    await start(async () => { throw new Error("Failed https://media.test/private-signature"); }, { STATUS_MESSAGES: "false" });
+    await playStream();
+    const [entry] = await listSubtitles();
+    const response = await fetch(local(entry.url));
+    expect(response.status).toBe(502);
+    expect(await response.text()).not.toContain("private-signature");
+    expect(log.mock.calls.flat().join(" ")).not.toContain(TOKEN);
+    expect(log.mock.calls.flat().join(" ")).not.toContain("private-signature");
+  } finally { log.mockRestore(); }
 });

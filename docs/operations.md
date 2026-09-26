@@ -138,3 +138,21 @@ npm run smoke -- tt1234567 2160p     # pick one by name fragment
 ```
 
 It exercises the real path — streams, play redirect, subtitle list, file — and prints provider, confidence, cue count and the first timestamps. It needs `.env` and consumes real provider quota.
+
+
+## Resource limits and retries
+
+`JOB_CONCURRENCY` limits active preparations across titles (default 2), with at most
+8 waiting jobs. Audio and translation concurrency still apply within each active
+job. A full queue leaves video playback working; retry subtitle selection later.
+`JOB_TIMEOUT_MS` bounds active work (default 10 minutes). `JOB_WAIT_MS` only limits
+an individual file request; a preparing notice does not cancel the background job.
+
+Cache deletion also invalidates completed in-memory jobs, so reopening a title
+can regenerate its subtitle. HTTP downloads are limited while streaming, archives
+have aggregate extraction and entry-count limits, and child stderr is bounded.
+Translation authentication failures fail immediately; only malformed model replies
+are split into smaller batches.
+
+The smoke command waits through preparing notices and exits unsuccessfully for
+failure notices, empty subtitles, or missing result headers.

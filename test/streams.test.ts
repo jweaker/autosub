@@ -106,3 +106,15 @@ describe("upstream addon", () => {
     expect(await upstream.streams("movie", "tt1", new AbortController().signal)).toEqual({ streams: [] });
   });
 });
+
+
+it("honours explicit identity over another device's selected release", async () => {
+  const registry = new StreamRegistry(await temporaryPath(), "https://sub.example", "secret");
+  const wrapped = await registry.wrap("movie", "tt123", [
+    { url: "https://d.example/a", behaviorHints: { filename: "A.mkv", videoHash: "aaaa" } },
+    { url: "https://d.example/b", behaviorHints: { filename: "B.mkv", videoHash: "bbbb" } },
+  ]);
+  await registry.select(String(wrapped[0].url).split("/").at(-1)!);
+  expect((await registry.find(movie({ videoHash: "bbbb", filename: "B.mkv" })))?.filename).toBe("B.mkv");
+  expect(await registry.find(movie({ videoHash: "unknown", filename: "A.mkv" }))).toBeUndefined();
+});

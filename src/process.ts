@@ -1,3 +1,4 @@
+import { safeError } from "./errors.js";
 import { spawn } from "node:child_process";
 
 export interface ProcessResult {
@@ -71,13 +72,18 @@ export function runProcess(command: string, args: string[], options: ProcessOpti
       if (outputBytes > limit) stop(new Error(`${command} exceeded the ${limit} byte output limit`));
       else stdout.push(chunk);
     });
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    let stderrBytes = 0;
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > 256 * 1024) stop(new Error(`${command} exceeded the stderr limit`));
+      else stderr.push(chunk);
+    });
     child.stdin.on("error", () => undefined);
     child.on("error", (error) => settle(error));
     child.on("close", (code) => {
       const errorText = Buffer.concat(stderr).toString("utf8");
       if (failure) settle(failure);
-      else if (code !== 0) settle(new Error(`${command} exited ${code}: ${errorText.slice(-800)}`));
+      else if (code !== 0) settle(new Error(`${command} exited ${code}: ${safeError(errorText).slice(-800)}`));
       else settle(undefined, { stdout: Buffer.concat(stdout), stderr: errorText });
     });
 

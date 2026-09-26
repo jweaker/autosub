@@ -120,8 +120,10 @@ Every setting is an environment variable; [.env.example](.env.example) documents
 | `FALLBACK_REFERENCE_LANGUAGES` | `en` | Languages that may carry timing when the spoken language has no usable subtitle |
 | `CANDIDATE_LIMIT` | `10` | Candidates downloaded and validated per language |
 | `JOB_WAIT_MS` | `120000` | How long a subtitle request waits for preparation |
+| `JOB_CONCURRENCY` | `2` | Maximum simultaneous preparations across all titles |
+| `JOB_TIMEOUT_MS` | `600000` | Active preparation deadline; cancels pending work |
 | `CACHE_TTL_DAYS` | `30` | Age at which cached subtitles are swept |
-| `AUDIO_BUDGET_MB` | `240` | Ceiling on bytes one audio analysis may download |
+| `AUDIO_BUDGET_MB` | `240` | Estimated audio sampling budget, including replacement samples |
 | `TRANSLATION_PROVIDER` | `gemini` | `gemini`, `openai` (any chat-completions endpoint), `deepl`, or `libretranslate` |
 | `TRANSLATION_REASONING_EFFORT` | `medium` | `reasoning_effort` sent to an `openai` endpoint |
 | `TRANSLATION_CONCURRENCY` | `12` | Maximum independent AI batches; automatically reduced under endpoint backpressure (1–12) |

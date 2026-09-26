@@ -1,11 +1,13 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { PreparationError, safeError } from "./errors.js";
 import { readFileSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { alignSubtitle, alignSubtitleToReference, alignSubtitleToTranscript, snapToSpeech, speechOffsetError } from "./alignment.js";
 import { AudioAnalyzer } from "./audio.js";
 import { stableKey, SubtitleCache } from "./cache.js";
 import { translationConfigured, type AppConfig } from "./config.js";
-import type { AudioProbeResult, CompletedSubtitle, RankedCandidate, StreamRecord, SubtitleCandidate, SubtitleCue, SubtitleProvider, SubtitleRequest } from "./domain.js";
+import type { AlignmentResult, AudioProbeResult, CompletedSubtitle, RankedCandidate, StreamRecord, SubtitleCandidate, SubtitleCue, SubtitleProvider, SubtitleRequest } from "./domain.js";
 import { languageName, normalizeLanguage } from "./languages.js";
 import { MetadataService } from "./metadata.js";
 import { HttpError } from "./http.js";
@@ -15,7 +17,7 @@ import { prepareSubtitle } from "./subtitle-content.js";
 import { createTranslator, type Translator } from "./translation/index.js";
 
 /** Cache key version; bump when a change should invalidate stored subtitles. */
-const CACHE_VERSION = 11;
+const CACHE_VERSION = 12;
 const PROBE_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_CACHED_PROBES = 12;
 const DOWNLOAD_TIMEOUT_MS = 20_000;
@@ -76,6 +78,12 @@ export interface EvaluationSummary {
   cleanup: { removed: number; merged: number; adjusted: number };
 }
 
+interface RunContext {
+  signal?: AbortSignal;
+  parsed: Map<string, Promise<{ cleanup: ReturnType<typeof stabilizeCues>; contentHash: string }>>;
+  aligned: WeakMap<Aligner, Map<string, Evaluated>>;
+}
+
 interface Evaluated {
   ranked: RankedCandidate;
   content: string;
@@ -84,11 +92,12 @@ interface Evaluated {
   rate?: number;
   cleanup: { removed: number; merged: number; adjusted: number };
   contentHash: string;
+  evidence: AlignmentResult["evidence"];
 }
 
-type Aligner = (cues: SubtitleCue[]) => { cues: SubtitleCue[]; confidence: number; offsetMs: number; rate?: number };
+type Aligner = (cues: SubtitleCue[]) => Pick<AlignmentResult, "cues" | "confidence" | "offsetMs" | "rate" | "evidence">;
 
-const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const describe = safeError;
 
 /**
  * Turns "a user pressed play on this release" into one trusted subtitle.
@@ -98,6 +107,7 @@ const describe = (error: unknown): string => (error instanceof Error ? error.mes
  * target language is only accepted if it matches that trusted timing.
  */
 export class AutoSubPipeline {
+  private readonly context = new AsyncLocalStorage<RunContext>();
   private readonly audio: AudioAnalyzer;
   private readonly metadata: MetadataService;
   private readonly translator: Translator;
@@ -131,16 +141,19 @@ export class AutoSubPipeline {
     // Providers retry internally; this budget bounds the whole attempt so one
     // slow API cannot hold up the wave.
     const budgetMs = this.config.providerTimeoutMs * 3;
+    const signal = this.context.getStore()?.signal;
+    signal?.throwIfAborted();
     const settled = await Promise.allSettled(this.providers.map(async (provider) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), budgetMs);
       try {
-        return await provider.search(query, controller.signal);
+        return await provider.search(query, signal ? AbortSignal.any([controller.signal, signal]) : controller.signal);
       } finally {
         clearTimeout(timer);
       }
     }));
 
+    this.context.getStore()?.signal?.throwIfAborted();
     const unique = new Map<string, SubtitleCandidate>();
     for (let index = 0; index < settled.length; index += 1) {
       const result = settled[index];
@@ -149,7 +162,7 @@ export class AutoSubPipeline {
         if (failures) failures[this.providers[index].name] = describe(result.reason).slice(0, 160);
         continue;
       }
-      for (const candidate of result.value) unique.set(`${candidate.provider}:${candidate.providerId}`, candidate);
+      for (const candidate of result.value.filter((candidate) => languages.includes(normalizeLanguage(candidate.language) || ""))) unique.set(`${candidate.provider}:${candidate.providerId}`, candidate);
     }
     return [...unique.values()];
   }
@@ -191,7 +204,7 @@ export class AutoSubPipeline {
    */
   private prefetch(request: SubtitleRequest, candidates: SubtitleCandidate[], excluded: Set<string>): void {
     const usable = candidates.filter((candidate) => !excluded.has(variantId(candidate)));
-    for (const ranked of rankCandidates(request, usable).slice(0, CANDIDATES_PER_WAVE)) {
+    for (const ranked of this.nextWave(rankCandidates(request, usable).slice(0, this.config.candidateLimit))) {
       void this.download(ranked.candidate).catch(() => undefined);
     }
   }
@@ -227,21 +240,43 @@ export class AutoSubPipeline {
   private async evaluateCandidate(item: RankedCandidate, align: Aligner, excluded: Set<string>): Promise<Evaluated | undefined> {
     if (!this.byName.has(item.candidate.provider)) return undefined;
     try {
-      const raw = await this.download(item.candidate);
-      const cleanup = stabilizeCues(parseSrt(prepareSubtitle(raw, item.candidate)));
-      const contentHash = stableKey(cleanup.cues.map(({ startMs, endMs, text }) => ({ startMs, endMs, text })));
+      const context = this.context.getStore();
+      context?.signal?.throwIfAborted();
+      const id = variantId(item.candidate);
+      let prepared = context?.parsed.get(id);
+      if (!prepared) {
+        prepared = this.download(item.candidate).then((raw) => {
+          context?.signal?.throwIfAborted();
+          const cleanup = stabilizeCues(parseSrt(prepareSubtitle(raw, item.candidate)));
+          return { cleanup, contentHash: stableKey(cleanup.cues) };
+        });
+        context?.parsed.set(id, prepared);
+      }
+      const { cleanup, contentHash } = await prepared;
+      context?.signal?.throwIfAborted();
       if (excluded.has(`content:${contentHash}`)) return undefined;
+      let previous = context?.aligned.get(align);
+      if (!previous && context) {
+        previous = new Map();
+        context.aligned.set(align, previous);
+      }
+      const cached = previous?.get(id);
+      if (cached) return cached;
       const aligned = align(cleanup.cues);
-      return {
+      const result: Evaluated = {
         ranked: item,
         content: serializeSrt(aligned.cues),
         confidence: aligned.confidence,
+        evidence: aligned.evidence,
         offsetMs: aligned.offsetMs,
         rate: aligned.rate,
         cleanup: { removed: cleanup.removed, merged: cleanup.merged, adjusted: cleanup.adjusted },
         contentHash,
       };
+      previous?.set(id, result);
+      return result;
     } catch (error) {
+      this.context.getStore()?.signal?.throwIfAborted();
       console.warn(`${item.candidate.provider} candidate ${item.candidate.providerId} failed:`, describe(error));
       return undefined;
     }
@@ -396,6 +431,7 @@ export class AutoSubPipeline {
     let acceptedWaves = 0;
     const strongEnoughToStop = Math.min(90, minimumConfidence + 15);
     while (remaining.length) {
+      this.context.getStore()?.signal?.throwIfAborted();
       const wave = this.nextWave(remaining);
       const results = await Promise.all(wave.map((item) => this.evaluateCandidate(item, align, excluded)));
       if (stats) stats.attempted += wave.length;
@@ -408,7 +444,7 @@ export class AutoSubPipeline {
           stats.cleanup.merged += result.cleanup.merged;
           stats.cleanup.adjusted += result.cleanup.adjusted;
         }
-        if (result.confidence >= minimumConfidence) {
+        if (result.confidence > 0 && result.confidence >= (result.evidence === "activity" ? Math.max(minimumConfidence, this.config.activityMinimumConfidence) : minimumConfidence)) {
           accepted.push(result);
           if (stats) stats.passed += 1;
         }
@@ -456,7 +492,7 @@ export class AutoSubPipeline {
     return stableKey({
       type: request.type,
       id: request.contentId,
-      streamFingerprint: stream.videoHash || stream.filename || stableKey(stream.url),
+      streamFingerprint: stream.videoHash || (stream.filename ? `${stream.filename}:${stream.videoSize || ""}` : stableKey(stream.url)),
       target: normalizeLanguage(targetLanguage) || targetLanguage,
     });
   }
@@ -484,6 +520,7 @@ export class AutoSubPipeline {
   }
 
   private async store(result: CompletedSubtitle, request: SubtitleRequest): Promise<CompletedSubtitle> {
+    this.context.getStore()?.signal?.throwIfAborted();
     const stored = {
       ...result,
       contentId: request.contentId,
@@ -499,7 +536,24 @@ export class AutoSubPipeline {
     return stored;
   }
 
-  async complete(originalRequest: SubtitleRequest, stream: StreamRecord, targetLanguage: string): Promise<CompletedSubtitle> {
+  complete(request: SubtitleRequest, stream: StreamRecord, language: string, signal?: AbortSignal): Promise<CompletedSubtitle> {
+    const controller = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    return this.context.run({ signal: combined, parsed: new Map(), aligned: new WeakMap() }, async () => {
+      try { return await this.completeRun(request, stream, language); }
+      finally {
+        controller.abort();
+        // Cached probe promises and download timers can retain the async context.
+        const context = this.context.getStore()!;
+        context.parsed.clear();
+        context.aligned = new WeakMap();
+      }
+    });
+  }
+
+  private async completeRun(originalRequest: SubtitleRequest, stream: StreamRecord, targetLanguage: string): Promise<CompletedSubtitle> {
+    const signal = this.context.getStore()?.signal;
+    signal?.throwIfAborted();
     const started = Date.now();
     const target = normalizeLanguage(targetLanguage) || targetLanguage;
     const request: SubtitleRequest = {
@@ -553,7 +607,7 @@ export class AutoSubPipeline {
     };
     const fail = (reason: string): never => {
       summary("failed", undefined, undefined, undefined, reason);
-      throw new Error(reason);
+      throw new PreparationError("no-match", reason);
     };
 
     try {
@@ -564,17 +618,19 @@ export class AutoSubPipeline {
       }
       if (!this.config.audioAnalysisEnabled) fail("Audio analysis is disabled; refusing to guess a subtitle");
 
-      const metadataLanguage = await mark("metadata", this.metadata.originalLanguage(request.imdbId, request.type));
-      const initialSourceLanguages = normalizedSet([metadataLanguage, ...this.config.referenceLanguages]);
-
-      // Audio analysis and the provider searches are independent; overlapping
-      // them removes several seconds from every cold start.
-      const analysis = this.analyze(stream, metadataLanguage);
+      // Target search and media probing need no metadata; start them immediately.
+      const targetPromise = mark("searchTarget", this.search(request, [target], providerErrors));
+      const metadataPromise = mark("metadata", this.metadata.originalLanguage(request.imdbId, request.type, signal));
+      const analysis = this.analyze(stream, metadataPromise);
       const analysisPromise = mark("audio", analysis.probe);
-      const initialSourcePromise = mark("search", this.search(request, initialSourceLanguages, providerErrors));
-      const targetPromise = initialSourceLanguages.includes(target)
-        ? initialSourcePromise
-        : mark("searchTarget", this.search(request, [target], providerErrors));
+      // Attach handlers immediately while metadata is still pending.
+      void targetPromise.catch(() => undefined);
+      void analysisPromise.catch(() => undefined);
+      const metadataLanguage = await metadataPromise;
+      signal?.throwIfAborted();
+      const initialSourceLanguages = normalizedSet([metadataLanguage, ...this.config.referenceLanguages]);
+      const initialSourcePromise = mark("search", this.search(request, initialSourceLanguages.filter((language) => language !== target), providerErrors));
+      void initialSourcePromise.catch(() => undefined);
 
       const probe = await analysisPromise;
       audioUsage = {
@@ -589,13 +645,13 @@ export class AutoSubPipeline {
       const sourceLanguages = normalizedSet([...initialSourceLanguages, probe.audioLanguage]);
       if (!sourceLanguages.length) fail("Could not determine the original audio language");
 
-      const missing = sourceLanguages.filter((language) => !initialSourceLanguages.includes(language));
+      const missing = sourceLanguages.filter((language) => language !== target && !initialSourceLanguages.includes(language));
       const [initialSource, additionalSource, targetCandidates] = await Promise.all([
         initialSourcePromise,
         this.search(request, missing, providerErrors),
         targetPromise,
       ]);
-      const sourceCandidates = [...initialSource, ...additionalSource];
+      const sourceCandidates = [...initialSource, ...additionalSource, ...(sourceLanguages.includes(target) ? targetCandidates : [])];
 
       // The target files are needed next in almost every run; fetching them now
       // overlaps their transfer with validating the source track.
@@ -610,11 +666,12 @@ export class AutoSubPipeline {
       // The best transcript-validated track is kept as the translation source
       // should no target subtitle fit any of them.
       let bestSource: Evaluated | undefined;
+      const alignSource: Aligner = (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000);
       for (let attempt = 0; attempt < MAX_SOURCE_ATTEMPTS; attempt += 1) {
         const source = await mark(`validateSource${attempt || ""}`, this.evaluate(
           request,
           sourceCandidates,
-          (cues) => alignSubtitleToTranscript(cues, probe.windows, this.config.maxSyncOffsetSeconds * 1000),
+          alignSource,
           rejectedSources,
           this.config.minimumConfidence,
           evaluation(evaluations, "source"),
@@ -623,7 +680,7 @@ export class AutoSubPipeline {
         bestSource ??= source;
         log("Trusted timing", source, probe, started, stages);
 
-        const settledSource = sourceLanguages.includes(target)
+        const settledSource = normalizeLanguage(source.ranked.candidate.language) === target
           ? this.settleOnSpeech(source.content, probe, variantId(source.ranked.candidate), reportSpeechError)
           : undefined;
         if (settledSource) {
@@ -706,7 +763,7 @@ export class AutoSubPipeline {
 
       const referenceCues = parseSrt(translationSource.content);
       console.log(`No ${target} timing match; translating trusted ${sourceLanguage} timing with ${this.translator.name} (${this.config.translation.model})`);
-      const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target));
+      const translated = await mark("translate", this.translator.translate(referenceCues, sourceLanguage, target, signal));
       // A translation carries the timing of the track it was translated from, so
       // it answers to the audio like everything else.
       const settledTranslation = this.settleOnSpeech(serializeSrt(translated), probe, "the translation", reportSpeechError);
@@ -744,15 +801,15 @@ export class AutoSubPipeline {
    * memory for the release.
    * Reusing the object also reuses the aligner's per-window precomputation.
    */
-  private analyze(stream: StreamRecord, metadataLanguage: string | undefined): { probe: Promise<AudioProbeResult>; reused: boolean } {
+  private analyze(stream: StreamRecord, metadataLanguage: Promise<string | undefined>): { probe: Promise<AudioProbeResult>; reused: boolean } {
     const key = stream.videoHash || stream.url;
     const cached = this.probes.get(key);
     if (cached && Date.now() - cached.at < PROBE_TTL_MS) return { probe: cached.probe, reused: true };
     // The promise is cached, not the result, so two languages starting together
     // share one ffmpeg pass instead of racing to make the same one.
-    const probe = this.audio.analyze(stream, metadataLanguage);
+    const probe = this.audio.analyze(stream, metadataLanguage, this.context.getStore()?.signal);
     this.probes.set(key, { probe, at: Date.now() });
-    void probe.catch(() => this.probes.delete(key));
+    void probe.catch(() => { if (this.probes.get(key)?.probe === probe) this.probes.delete(key); });
     while (this.probes.size > MAX_CACHED_PROBES) {
       const oldest = this.probes.keys().next();
       if (oldest.done) break;
@@ -772,8 +829,14 @@ export class AutoSubPipeline {
     // Kept on disk because the runs worth explaining are usually the ones
     // followed by a restart.
     this.writingRuns = this.writingRuns
-      .then(() => writeFile(this.runsPath, JSON.stringify(this.runs), { encoding: "utf8", mode: 0o600 }))
-      .catch(() => undefined);
+      .then(async () => {
+        const temporary = `${this.runsPath}.${process.pid}.tmp`;
+        try {
+          await writeFile(temporary, JSON.stringify(this.runs), { encoding: "utf8", mode: 0o600 });
+          await rename(temporary, this.runsPath);
+        } finally { await rm(temporary, { force: true }); }
+      })
+      .catch((error: unknown) => console.warn("Could not persist run history:", safeError(error)));
   }
 
   private loadRuns(): void {

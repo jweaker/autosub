@@ -1,3 +1,4 @@
+import { PreparationError } from "./errors.js";
 import { randomBytes } from "node:crypto";
 import type { CompletedSubtitle, StreamRecord, SubtitleRequest } from "./domain.js";
 import type { AutoSubPipeline } from "./pipeline.js";
@@ -10,7 +11,10 @@ interface Job {
   language: string;
   promise: Promise<CompletedSubtitle>;
   createdAt: number;
-  state: "preparing" | "ready" | "failed";
+  state: "queued" | "preparing" | "ready" | "failed";
+  cacheKey?: string;
+  controller: AbortController;
+  run: () => void;
 }
 
 const DEFAULT_RETENTION_MS = 6 * 60 * 60 * 1000;
@@ -40,10 +44,14 @@ export class JobTimeoutError extends Error {
 export class JobManager {
   private readonly jobs = new Map<string, Job>();
   private readonly byKey = new Map<string, string>();
+  private readonly queue: Job[] = [];
+  private stopping = false;
 
   constructor(
     private readonly pipeline: AutoSubPipeline,
     private readonly retentionMs = DEFAULT_RETENTION_MS,
+    private readonly concurrency = 2,
+    private readonly timeoutMs = 600_000,
   ) {}
 
   get size(): number {
@@ -57,37 +65,69 @@ export class JobManager {
   }
 
   start(request: SubtitleRequest, stream: StreamRecord, language: string): string {
+    this.prune();
     const key = this.pipeline.releaseKey(request, stream, language);
     const existing = this.byKey.get(key);
     if (existing && this.jobs.has(existing)) return existing;
+    if (this.stopping || this.queue.length >= 8) throw new PreparationError("busy", "Subtitle preparation is busy; retry shortly");
 
     const id = randomBytes(16).toString("base64url");
+    const controller = new AbortController();
+    let resolve!: (result: CompletedSubtitle) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<CompletedSubtitle>((yes, no) => { resolve = yes; reject = no; });
     const job: Job = {
-      id,
-      key,
-      request,
-      stream,
-      language,
-      promise: this.pipeline.complete(request, stream, language),
+      id, key, request, stream, language, promise, controller,
       createdAt: Date.now(),
-      state: "preparing",
+      state: "queued",
+      run: () => {
+        job.state = "preparing";
+        const timer = setTimeout(() => controller.abort(new PreparationError("deadline", "Subtitle preparation exceeded its time budget")), this.timeoutMs);
+        void this.pipeline.complete(request, stream, language, controller.signal).then((result) => {
+          controller.signal.throwIfAborted();
+          job.cacheKey = result.key;
+          resolve(result);
+        }).catch(reject).finally(() => clearTimeout(timer));
+      },
     };
     this.jobs.set(id, job);
     this.byKey.set(key, id);
-    void job.promise.then(
-      () => {
-        job.state = "ready";
-      },
+    this.queue.push(job);
+    void promise.then(
+      () => { job.state = "ready"; this.pump(); },
       () => {
         job.state = "failed";
-        // Keep the failed job so the in-flight file request sees the real
-        // error, but let the next playback retry instead of pinning the
-        // failure for the whole retention window.
         if (this.byKey.get(key) === id) this.byKey.delete(key);
+        this.pump();
       },
     );
-    this.prune();
+    this.pump();
     return id;
+  }
+
+  get queued(): number { return this.queue.length; }
+
+  private pump(): void {
+    while (this.queue.length && this.running < this.concurrency) this.queue.shift()!.run();
+  }
+
+  /** Disk cache deletion also forgets completed in-memory results. */
+  invalidate(keys: string[]): void {
+    const removed = new Set(keys);
+    for (const [id, job] of this.jobs) {
+      if (job.state !== "ready" || !job.cacheKey || !removed.has(job.cacheKey)) continue;
+      this.jobs.delete(id);
+      if (this.byKey.get(job.key) === id) this.byKey.delete(job.key);
+    }
+  }
+
+  shutdown(): void {
+    this.stopping = true;
+    for (const job of this.jobs.values()) {
+      if (job.state === "queued" || job.state === "preparing") {
+        job.controller.abort(new PreparationError("unavailable", "Server is restarting; reopen the title shortly"));
+      }
+    }
   }
 
   /** Target language of a job, used to phrase status messages. */
@@ -111,10 +151,10 @@ export class JobManager {
     }
   }
 
-  private prune(): void {
+  prune(): void {
     const cutoff = Date.now() - this.retentionMs;
     for (const [id, job] of this.jobs) {
-      if (job.createdAt >= cutoff || job.state === "preparing") continue;
+      if (job.createdAt >= cutoff || (job.state === "preparing" || job.state === "queued")) continue;
       this.jobs.delete(id);
       if (this.byKey.get(job.key) === id) this.byKey.delete(job.key);
     }

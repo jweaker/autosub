@@ -44,3 +44,8 @@ describe("runProcess", () => {
     await expect(pending).rejects.toThrow(/aborted/);
   });
 });
+
+it("bounds stderr as well as stdout", async () => {
+  await expect(runProcess("node", ["-e", "setInterval(() => process.stderr.write('x'.repeat(65536)), 1)"]))
+    .rejects.toThrow(/stderr limit/);
+});

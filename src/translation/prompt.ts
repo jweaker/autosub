@@ -28,26 +28,34 @@ export interface TranslationRow {
   text: string;
 }
 
+export class TranslationResponseError extends Error {}
+
 /** Models sometimes wrap JSON in prose or code fences; recover the array. */
 export function parseRows(text: string): TranslationRow[] {
-  const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "");
-  const start = trimmed.indexOf("[");
-  const end = trimmed.lastIndexOf("]");
-  const body = start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed;
-  const parsed = JSON.parse(body) as unknown;
-  if (Array.isArray(parsed)) return parsed as TranslationRow[];
-  const rows = (parsed as { cues?: TranslationRow[]; translations?: TranslationRow[] });
-  return rows.cues || rows.translations || [];
+  try {
+    const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "");
+    const start = trimmed.indexOf("[");
+    const end = trimmed.lastIndexOf("]");
+    const body = start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed;
+    const parsed = JSON.parse(body);
+    const rows: unknown = Array.isArray(parsed) ? parsed : parsed?.cues || parsed?.translations;
+    if (!Array.isArray(rows)) throw new Error("Expected an array of cue translations");
+    return rows;
+  } catch (error) {
+    throw new TranslationResponseError(error instanceof Error ? error.message : "Invalid translation JSON");
+  }
 }
 
-/** Keeps only rows that belong to this batch, so a bad answer fails loudly. */
+/** Every expected id must appear exactly once, with nonempty text. */
 export function collectRows(batch: SubtitleCue[], rows: TranslationRow[]): Map<number, string> {
   const expected = new Set(batch.map((cue) => cue.id));
   const output = new Map<number, string>();
   for (const row of rows) {
-    if (!expected.has(row.id) || typeof row.text !== "string" || !row.text.trim() || output.has(row.id)) continue;
+    if (!row || !expected.has(row.id) || typeof row.text !== "string" || !row.text.trim() || output.has(row.id)) {
+      throw new TranslationResponseError("Model returned an invalid, unexpected, or duplicate cue");
+    }
     output.set(row.id, row.text.trim());
   }
-  if (output.size !== batch.length) throw new Error(`Model returned ${output.size}/${batch.length} valid cue translations`);
+  if (output.size !== batch.length) throw new TranslationResponseError(`Model returned ${output.size}/${batch.length} valid cue translations`);
   return output;
 }

@@ -1,3 +1,4 @@
+import { PreparationError, safeError } from "./errors.js";
 import type { AppConfig } from "./config.js";
 import type { AudioProbeResult, SpeechInterval, StreamRecord, TranscriptWord, VadWindow } from "./domain.js";
 import { request } from "./http.js";
@@ -35,8 +36,6 @@ const TRANSCRIBE_TIMEOUT_MS = 20_000;
 const MINIMUM_WINDOWS = 3;
 const MINIMUM_TRANSCRIPTS = 3;
 const MINIMUM_SAMPLE_SECONDS = 8;
-/** How far past AUDIO_BUDGET_MB the shortest windows may still go. */
-const MAX_BUDGET_OVERRUN = 4;
 const PROBE_SIZE_BYTES = 8 * 1024 * 1024;
 const PROBE_ANALYZE_US = 4_000_000;
 const UNKNOWN_DURATION_FALLBACK_MS = 90 * 60 * 1000;
@@ -155,7 +154,7 @@ export class AudioAnalyzer {
 
   constructor(private readonly config: AppConfig) {}
 
-  private async resolveMediaUrl(stream: StreamRecord): Promise<string> {
+  private async resolveMediaUrl(stream: StreamRecord, signal?: AbortSignal): Promise<string> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 12_000);
     try {
@@ -165,7 +164,7 @@ export class AudioAnalyzer {
         method: "GET",
         redirect: "manual",
         headers: stream.requestHeaders,
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       });
       const location = response.headers.get("location");
       await response.body?.cancel().catch(() => undefined);
@@ -174,40 +173,43 @@ export class AudioAnalyzer {
         if (resolved.protocol === "http:" || resolved.protocol === "https:") return resolved.toString();
       }
     } catch (error) {
-      console.warn("Media pre-resolution failed; using the original resolver URL:", error instanceof Error ? error.message : error);
+      signal?.throwIfAborted();
+      console.warn("Media pre-resolution failed; using the original resolver URL:", safeError(error));
     } finally {
       clearTimeout(timer);
     }
     return stream.url;
   }
 
-  private async vad(pcm: Buffer): Promise<SpeechInterval[]> {
+  private async vad(pcm: Buffer, signal?: AbortSignal): Promise<SpeechInterval[]> {
     this.vadCheck ??= runProcess(this.config.pythonPath, ["-c", "import webrtcvad"], {
       timeoutMs: 5_000,
       maxOutputBytes: 64 * 1024,
     }).then(() => true, (error: unknown) => {
       this.vadUnavailable = true;
-      console.warn("WebRTC VAD unavailable; using energy VAD:", error instanceof Error ? error.message : error);
+      console.warn("WebRTC VAD unavailable; using energy VAD:", safeError(error));
       return false;
     });
     if (this.vadUnavailable || !await this.vadCheck) return energyVad(pcm);
     try {
       const result = await runProcess(this.config.pythonPath, [this.config.vadScriptPath, "--sample-rate", String(SAMPLE_RATE)], {
         input: pcm,
+        signal,
         timeoutMs: VAD_TIMEOUT_MS,
         maxOutputBytes: 2 * 1024 * 1024,
       });
       const parsed = JSON.parse(result.stdout.toString("utf8")) as { intervals?: SpeechInterval[] };
       if (Array.isArray(parsed.intervals)) return parsed.intervals;
     } catch (error) {
-      console.warn("WebRTC VAD unavailable; using energy VAD:", error instanceof Error ? error.message : error);
+      signal?.throwIfAborted();
+      console.warn("WebRTC VAD unavailable; using energy VAD:", safeError(error));
       this.vadUnavailable = true;
       this.vadCheck = Promise.resolve(false);
     }
     return energyVad(pcm);
   }
 
-  private async transcribeOnce(pcm: Buffer, languageHint?: string): Promise<Transcription> {
+  private async transcribeOnce(pcm: Buffer, languageHint?: string, signal?: AbortSignal): Promise<Transcription> {
     if (!this.config.deepgram.apiKey) return { requests: 0 };
     const url = new URL("https://api.deepgram.com/v1/listen");
     url.searchParams.set("model", this.config.deepgram.model);
@@ -227,6 +229,7 @@ export class AudioAnalyzer {
         },
         body: pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength) as ArrayBuffer,
         timeoutMs: TRANSCRIBE_TIMEOUT_MS,
+        signal,
         label: "Deepgram transcription",
       });
       const body = await response.json() as {
@@ -256,18 +259,19 @@ export class AudioAnalyzer {
         }),
       };
     } catch (error) {
-      console.warn("Deepgram transcription failed:", error instanceof Error ? error.message : error);
+      signal?.throwIfAborted();
+      console.warn("Deepgram transcription failed:", safeError(error));
       return { requests: 1 };
     }
   }
 
-  private async transcribe(pcm: Buffer, languageHint?: string): Promise<Transcription> {
-    const result = await this.transcribeOnce(pcm, languageHint);
+  private async transcribe(pcm: Buffer, languageHint?: string, signal?: AbortSignal): Promise<Transcription> {
+    const result = await this.transcribeOnce(pcm, languageHint, signal);
     // TMDB/container language tags are usually right, but releases are often
     // mislabeled. Retry using Deepgram detection only when the explicit model
     // produced no speech, so correct non-English tracks do not pay extra time.
     if (languageHint && !result.transcript) {
-      const detected = await this.transcribeOnce(pcm);
+      const detected = await this.transcribeOnce(pcm, undefined, signal);
       detected.requests = (result.requests || 0) + (detected.requests || 0);
       return detected;
     }
@@ -281,7 +285,7 @@ export class AudioAnalyzer {
       || streams[0];
   }
 
-  private async probe(mediaUrl: string, headers?: string): Promise<{
+  private async probe(mediaUrl: string, headers?: string, signal?: AbortSignal): Promise<{
     durationMs: number;
     durationKnown: boolean;
     streams: ProbeStream[];
@@ -293,7 +297,7 @@ export class AudioAnalyzer {
       "-show_entries", "format=duration,size,bit_rate:stream=index,codec_type,duration:stream_tags=language,title:stream_disposition=default",
       "-of", "json", mediaUrl,
     );
-    const result = await runProcess(this.config.ffprobePath, args, { timeoutMs: PROBE_TIMEOUT_MS, maxOutputBytes: 2 * 1024 * 1024 });
+    const result = await runProcess(this.config.ffprobePath, args, { signal, timeoutMs: PROBE_TIMEOUT_MS, maxOutputBytes: 2 * 1024 * 1024 });
     const data = JSON.parse(result.stdout.toString("utf8")) as {
       format?: { duration?: string; size?: string; bit_rate?: string };
       streams?: ProbeStream[];
@@ -303,7 +307,7 @@ export class AudioAnalyzer {
     // then blames the audio, so say what actually happened.
     const formatSeconds = Number(data.format?.duration);
     if (Number.isFinite(formatSeconds) && formatSeconds > 0 && formatSeconds < 60) {
-      throw new Error("The debrid service returned a short placeholder video instead of this release; pick another stream");
+      throw new PreparationError("no-match", "The debrid service returned a short placeholder video instead of this release; pick another stream");
     }
     const durationSeconds = [formatSeconds, ...(data.streams || []).map((stream) => Number(stream.duration))]
       .filter((value) => Number.isFinite(value) && value >= 60)
@@ -324,7 +328,7 @@ export class AudioAnalyzer {
 
 
 
-  private sampler(mediaUrl: string, headers: string | undefined, streamIndex: number, seconds: number) {
+  private sampler(mediaUrl: string, headers: string | undefined, streamIndex: number, seconds: number, signal?: AbortSignal) {
     return async (startMs: number): Promise<Sample | undefined> => {
       const args = ["-v", "error", ...HTTP_INPUT_ARGS, "-ss", (startMs / 1000).toFixed(3)];
       if (headers) args.push("-headers", headers);
@@ -334,6 +338,7 @@ export class AudioAnalyzer {
       );
       try {
         const extraction = await runProcess(this.config.ffmpegPath, args, {
+          signal,
           timeoutMs: Math.max(45_000, seconds * 2_000),
           maxOutputBytes: Math.ceil(seconds * BYTES_PER_SECOND * 1.1),
         });
@@ -343,11 +348,12 @@ export class AudioAnalyzer {
           window: {
             startMs: Math.round(startMs),
             durationMs: Math.round((extraction.stdout.length / BYTES_PER_SECOND) * 1000),
-            speech: await this.vad(extraction.stdout),
+            speech: await this.vad(extraction.stdout, signal),
           },
         };
       } catch (error) {
-        console.warn("Audio sample failed:", error instanceof Error ? error.message : error);
+        signal?.throwIfAborted();
+        console.warn("Audio sample failed:", safeError(error));
         return undefined;
       }
     };
@@ -366,12 +372,13 @@ export class AudioAnalyzer {
     streamIndex: number,
     seconds: number,
     languageHint?: string,
+    signal?: AbortSignal,
   ): (startMs: number) => Promise<Sample | undefined> {
-    const sample = this.sampler(mediaUrl, headers, streamIndex, seconds);
+    const sample = this.sampler(mediaUrl, headers, streamIndex, seconds, signal);
     return async (startMs: number): Promise<Sample | undefined> => {
       const item = await sample(startMs);
       if (!item) return undefined;
-      const transcription = await this.transcribe(item.pcm, languageHint);
+      const transcription = await this.transcribe(item.pcm, languageHint, signal);
       item.window.transcript = transcription.transcript;
       item.window.words = transcription.words;
       item.language = transcription.language;
@@ -380,49 +387,56 @@ export class AudioAnalyzer {
     };
   }
 
-  /** Runs windows in bounded waves; remote range seeks dominate cold-start latency. */
+  /** Refill each worker immediately; one slow seek must not stall the other workers. */
   private async collect(starts: number[], analyse: (startMs: number) => Promise<Sample | undefined>): Promise<Sample[]> {
     const collected: Sample[] = [];
-    const size = this.config.audioConcurrency;
-    for (let index = 0; index < starts.length; index += size) {
-      const wave = await Promise.all(starts.slice(index, index + size).map(analyse));
-      for (const item of wave) if (item) collected.push(item);
-    }
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(starts.length, this.config.audioConcurrency) }, async () => {
+      while (next < starts.length) {
+        const item = await analyse(starts[next++]);
+        if (item) collected.push(item);
+      }
+    }));
     return collected;
   }
 
-  async analyze(stream: StreamRecord, preferredLanguage?: string): Promise<AudioProbeResult> {
+  async analyze(stream: StreamRecord, preferredLanguage?: string | Promise<string | undefined>, signal?: AbortSignal): Promise<AudioProbeResult> {
+    signal?.throwIfAborted();
     const started = Date.now();
-    const mediaUrl = await this.resolveMediaUrl(stream);
+    const mediaUrl = await this.resolveMediaUrl(stream, signal);
     const resolvedAt = Date.now();
     const headers = safeHeaders(stream.requestHeaders);
-    const { durationMs, durationKnown, streams, bytesPerSecond } = await this.probe(mediaUrl, headers);
+    const { durationMs, durationKnown, streams, bytesPerSecond } = await this.probe(mediaUrl, headers, signal);
     const probedAt = Date.now();
 
     const audioStreams = streams.filter((item) => item.codec_type === "audio");
-    if (!audioStreams.length) throw new Error("Media contains no audio stream");
-    const preferred = normalizeLanguage(preferredLanguage);
+    if (!audioStreams.length) throw new PreparationError("no-match", "Media contains no audio stream");
+    const preferred = normalizeLanguage(await preferredLanguage);
     const selected = this.selectStream(audioStreams, preferred);
     let audioLanguage = normalizeLanguage(selected.tags?.language);
 
-    const count = Math.max(MINIMUM_WINDOWS + 1, this.config.audioSampleCount);
-    const seconds = sampleSecondsFor(this.config.audioSampleSeconds, count, this.config.audioBudgetBytes, bytesPerSecond);
-    // Mezzanine masters (ProRes, uncompressed) run at a gigabit or more; even
-    // the shortest windows would take minutes to pull and then time out, so
-    // say so at once instead of saturating the link for nothing.
-    if (bytesPerSecond && bytesPerSecond * seconds * count > this.config.audioBudgetBytes * MAX_BUDGET_OVERRUN) {
-      throw new Error(`This release is ${Math.round((bytesPerSecond * 8) / 1e6)} Mbps, too heavy to sample; pick a smaller stream`);
+    const count = Math.max(durationKnown ? MINIMUM_WINDOWS + 1 : 5, this.config.audioSampleCount);
+    const seconds = sampleSecondsFor(this.config.audioSampleSeconds, count, this.config.audioBudgetBytes * 0.8, bytesPerSecond);
+    // Reject releases whose minimum useful samples exceed the estimated budget.
+    if (bytesPerSecond && bytesPerSecond * seconds * count > this.config.audioBudgetBytes) {
+      throw new PreparationError("no-match", `This release is ${Math.round((bytesPerSecond * 8) / 1e6)} Mbps, too heavy to sample; pick a smaller stream`);
     }
     // Skip credits at both ends when duration is known. Remote MP4s sometimes
     // omit it entirely; fixed, widening seeks keep those releases usable.
     const starts = sampleStartsFor(durationKnown ? durationMs : undefined, seconds, count);
 
-    const analyse = this.analyser(mediaUrl, headers, selected.index, seconds, preferred || audioLanguage);
+    const analyse = this.analyser(mediaUrl, headers, selected.index, seconds, preferred || audioLanguage, signal);
     const samples = await this.collect(starts, analyse);
 
     // Quiet windows are common (action scenes, music). Replace a few rather
     // than failing the whole title.
-    if (samples.filter((item) => item.window.transcript).length < MINIMUM_TRANSCRIPTS) {
+    const useful = samples.filter((item) => this.config.deepgram.apiKey
+      ? Boolean(item.window.transcript)
+      : item.window.speech.reduce((sum, interval) => sum + interval.endMs - interval.startMs, 0) >= 1_000).length;
+    const remainingSamples = bytesPerSecond
+      ? Math.max(0, Math.floor(this.config.audioBudgetBytes / (bytesPerSecond * seconds)) - starts.length)
+      : 2;
+    if (useful < MINIMUM_TRANSCRIPTS && remainingSamples > 0) {
       const alternatives = (durationKnown
         ? [0.18, 0.48, 0.76].map((fraction) => {
           const usableStart = starts[0];
@@ -431,15 +445,16 @@ export class AudioAnalyzer {
         })
         : [12, 42, 72].map((minutes) => minutes * 60_000))
         .filter((startMs) => starts.every((existing) => Math.abs(existing - startMs) > seconds * 2_000))
-        .slice(0, 2);
+        .slice(0, Math.min(2, remainingSamples));
       samples.push(...await this.collect(alternatives, analyse));
     }
 
-    // A container language tag stays authoritative; detection only fills a gap.
-    audioLanguage ||= samples.find((item) => item.language)?.language;
+    const detected = samples.filter((item) => item.window.transcript && item.language).map((item) => item.language!);
+    const majority = detected.find((language) => detected.filter((value) => value === language).length > detected.length / 2);
+    audioLanguage = majority || audioLanguage;
 
     const windows = samples.map((item) => item.window).sort((left, right) => left.startMs - right.startMs);
-    if (windows.length < MINIMUM_WINDOWS) throw new Error("Not enough audio samples could be read from the selected stream");
+    if (windows.length < MINIMUM_WINDOWS) throw new PreparationError("no-match", "Not enough audio samples could be read from the selected stream");
     const transcripts = windows.filter((window) => window.transcript).length;
     const deepgramRequests = samples.reduce((total, item) => total + (item.deepgramRequests || 0), 0);
     const deepgramSeconds = Number(samples.reduce((total, item) =>

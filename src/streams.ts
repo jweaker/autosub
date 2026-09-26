@@ -193,9 +193,6 @@ export class StreamRegistry {
 
   async find(request: SubtitleRequest): Promise<StreamRecord | undefined> {
     await this.load();
-    const selectedId = this.selected.get(this.key(request.type, request.contentId));
-    const selected = selectedId ? this.records.get(selectedId) : undefined;
-    if (selected && Date.now() - selected.discoveredAt < this.ttlMs) return selected;
     const records = [...this.records.values()].filter((record) =>
       record.type === request.type
       && record.contentId === request.contentId
@@ -203,16 +200,20 @@ export class StreamRegistry {
     if (request.videoHash) {
       const match = records.find((record) => record.videoHash === request.videoHash);
       if (match) return match;
+      return records.find((record) => !record.videoHash && Boolean(request.filename)
+        && record.filename === request.filename
+        && (!request.videoSize || !record.videoSize || record.videoSize === request.videoSize));
     }
     if (request.filename) {
-      const match = records.find((record) => record.filename === request.filename);
-      if (match) return match;
+      return records.find((record) => record.filename === request.filename
+        && (!request.videoSize || !record.videoSize || record.videoSize === request.videoSize));
     }
     if (request.videoSize) {
-      const match = records.find((record) => record.videoSize === request.videoSize);
-      if (match) return match;
+      const matches = records.filter((record) => record.videoSize === request.videoSize);
+      return matches.length === 1 ? matches[0] : undefined;
     }
-    return records.length === 1 ? records[0] : undefined;
+    const selectedId = this.selected.get(this.key(request.type, request.contentId));
+    return records.find((record) => record.playId === selectedId);
   }
 
   /**

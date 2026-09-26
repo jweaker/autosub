@@ -4,6 +4,7 @@ import { stableKey, type SubtitleCache } from "./cache.js";
 import { translationConfigured, type AppConfig } from "./config.js";
 import { renderDashboard } from "./dashboard.js";
 import type { CompletedSubtitle, SubtitleProvider, SubtitleRequest } from "./domain.js";
+import { PreparationError, safeError } from "./errors.js";
 import { HttpError } from "./http.js";
 import { JobExpiredError, type JobManager, JobTimeoutError } from "./jobs.js";
 import { stremioLanguage, TARGET_LANGUAGE } from "./languages.js";
@@ -52,8 +53,8 @@ const manifest = {
 function statusFor(error: unknown): number {
   if (error instanceof JobExpiredError) return 404;
   if (error instanceof JobTimeoutError) return 504;
+  if (error instanceof PreparationError) return ({ "no-match": 422, unavailable: 502, deadline: 504, busy: 429 })[error.code];
   if (error instanceof HttpError) return error.status === 429 ? 429 : 502;
-  if (error instanceof Error && /No subtitle|Could not determine|no audio stream|Not enough audio|placeholder|too heavy to sample/i.test(error.message)) return 422;
   return 502;
 }
 
@@ -127,7 +128,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
         ? { provider: config.translation.provider, model: config.translation.model, concurrency: config.translation.concurrency }
         : "disabled",
       languageDetectionFallback: config.deepgram.apiKey ? "deepgram" : "metadata-only",
-      jobs: { tracked: jobs.size, running: jobs.running },
+      jobs: { tracked: jobs.size, running: jobs.running, queued: jobs.queued },
       uptimeSeconds: Math.round(process.uptime()),
     });
   });
@@ -188,6 +189,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
         const submitted: unknown[] = Array.isArray(request.body.key) ? request.body.key : [request.body.key];
         const keys = submitted.filter((key: unknown): key is string => typeof key === "string" && /^[a-f0-9]{64}$/.test(key));
         const removed = await cache.removeMany(keys);
+        jobs.invalidate(keys);
         response.redirect(303, `/${encodeURIComponent(config.installToken)}/dashboard?cleared=${removed}#cache`);
       } catch (error) {
         next(error);
@@ -224,7 +226,12 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       // Start preparing before redirecting: the player will ask for the subtitle
       // list within seconds, and this is the only point where the exact release
       // is known.
-      jobs.start(parseSubtitleRequest(stream.type, stream.contentId, undefined, [TARGET_LANGUAGE]), stream, TARGET_LANGUAGE);
+      try {
+        jobs.start(parseSubtitleRequest(stream.type, stream.contentId, undefined, [TARGET_LANGUAGE]), stream, TARGET_LANGUAGE);
+      } catch (error) {
+        if (!(error instanceof PreparationError) || error.code !== "busy") throw error;
+        console.warn("Subtitle queue is full; playback will continue");
+      }
       response.setHeader("Cache-Control", "no-store");
       response.redirect(302, stream.url);
     } catch (error) {
@@ -283,7 +290,7 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
       ]), "expired");
       return;
     }
-    const reason = error instanceof Error ? error.message : "Unknown error";
+    const reason = safeError(error).split(config.installToken).join("[redacted]");
     console.warn(`Subtitle request failed: ${reason}`);
     sendNotice(response, failureTrack(reason), "failed");
   }
@@ -323,10 +330,10 @@ export function createApp({ config, registry, upstream, jobs, providers, pipelin
   });
 
   app.use((error: unknown, request: Request, response: Response, _next: NextFunction) => {
-    const message = error instanceof Error ? error.message : "Unknown error";
+    const message = safeError(error).split(config.installToken).join("[redacted]");
     const status = statusFor(error);
-    if (status >= 500) console.error(`${request.method} ${request.path}: ${message}`);
-    else console.warn(`${request.method} ${request.path}: ${status} ${message}`);
+    if (status >= 500) console.error(`${request.method} ${request.route?.path || "unmatched route"}: ${message}`);
+    else console.warn(`${request.method} ${request.route?.path || "unmatched route"}: ${status} ${message}`);
     if (!response.headersSent) response.status(status).json({ error: message });
   });
 

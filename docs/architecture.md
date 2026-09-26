@@ -1,6 +1,6 @@
 # Architecture
 
-AutoSub is a single Node process. It speaks the Stremio addon protocol, shells out to FFmpeg for audio, and keeps a small amount of state on disk. There is no database and no queue.
+AutoSub is a single Node process. It speaks the Stremio addon protocol, shells out to FFmpeg for audio, and keeps a small amount of state on disk. There is no database. A bounded in-memory queue limits concurrent preparations.
 
 ## Why it is shaped this way
 
@@ -68,7 +68,7 @@ The subtitle list is requested *before* or *around* the play redirect depending 
 `AutoSubPipeline.complete()` runs the expensive path once per release and language:
 
 1. **Cache probe.** The key covers the media fingerprint, target language, and translation model.
-2. **Parallel start.** Audio analysis and provider searches are launched together; the searches for the source language do not wait for the probe.
+2. **Parallel start.** Arabic searches and media probing start while metadata loads. Source-language searches start when metadata is available; audio-track selection waits for that hint.
 3. **Source validation.** Candidates in the original language are aligned against the transcript (`alignSubtitleToTranscript`). The winner becomes the *trusted timing track*.
 4. **Target validation.** Candidates in the target language are aligned against that trusted track (`alignSubtitleToReference`). A match is served directly, with the lower of the two confidences.
 5. **Language-independent fallback.** If no subtitle in the spoken language can carry the timing, a subtitle in another language is validated against speech activity and used as the reference instead; failing that — and only when no timing track was trusted at all — the target is checked against speech activity directly. Once a track has been trusted, a target it rejected is not re-tried against weaker evidence: asking a lesser witness until one agrees is how a subtitle nobody vouched for reaches the screen. Speech activity does not care what language a subtitle is written in, which is what makes this possible — and it is weaker evidence, so both routes answer to `ACTIVITY_MINIMUM_CONFIDENCE`.
@@ -79,9 +79,9 @@ The subtitle list is requested *before* or *around* the play redirect depending 
 
 Each result carries a variant id — `provider:providerId`, or that id prefixed with `translated:` for a translation — plus a content fingerprint. Audio probes are kept in memory per release, so a re-run after a failure skips ffmpeg entirely.
 
-Candidates are downloaded in waves of up to three, giving distinct providers first choice and then filling unused seats by rank. A borderline match triggers one extra wave so it cannot hide a much stronger file immediately behind it. The first target wave starts downloading while the source track is still being validated. A provider that reports a long quota cooldown is paused for that period instead of being retried for every candidate.
+Each run reuses parsed candidate cues and source-alignment results when trying another timing reference. Candidates are downloaded in waves of up to three, giving distinct providers first choice and then filling unused seats by rank. A borderline match triggers one extra wave so it cannot hide a much stronger file immediately behind it. The first target wave starts downloading while the source track is still being validated. A provider that reports a long quota cooldown is paused for that period instead of being retried for every candidate.
 
-Every run records the wall-clock cost of each stage, failure reason, providers whose search failed, candidate counts, best rejected confidence, and cue cleanup; `/stats` reports the last 25. Audio analysis dominates a cold run, so its length adapts to the release: sampling reads the interleaved container, and `AUDIO_BUDGET_MB` caps how much of it one analysis may pull.
+Every run records the wall-clock cost of each stage, failure reason, providers whose search failed, candidate counts, best rejected confidence, and cue cleanup; `/stats` reports the last 25. Audio analysis dominates a cold run, so its length adapts to the release: sampling reads the interleaved container, and `AUDIO_BUDGET_MB` bounds estimated sampling bytes, including replacements. Container indexes, seeking, and variable bitrate add network overhead, so this is not a hard network-transfer cap.
 
 ## Alignment
 
@@ -113,8 +113,10 @@ All three are written to a unique temporary file and renamed, so a crash cannot 
 
 ## Failure policy
 
+- `JOB_CONCURRENCY` bounds active preparations (default two); up to eight more wait in memory. A full queue never prevents the video redirect.
+- `JOB_TIMEOUT_MS` cancels an active preparation after ten minutes by default. Shared subtitle downloads retain their own 20-second deadline.
 - A provider that fails is logged and skipped; the others still run.
 - A candidate that fails to download, unpack, decode or align is skipped; the next wave runs.
-- Anything below `MINIMUM_CONFIDENCE` is not served. The request fails instead.
+- Anything below `MINIMUM_CONFIDENCE` is not served. Activity-only alignment also enforces `ACTIVITY_MINIMUM_CONFIDENCE`, including when transcription falls back to activity. The request fails instead.
 - Errors are mapped to statuses a client can act on: 404 expired job, 422 nothing matched, 504 still working, 502 upstream fault.
 - Because a player renders none of those to the viewer, the subtitle routes convert them into a readable message track unless `STATUS_MESSAGES=false`.

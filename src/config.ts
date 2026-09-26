@@ -17,6 +17,8 @@ export interface AppConfig {
   dataDir: string;
   installToken: string;
   jobWaitMs: number;
+  jobConcurrency: number;
+  jobTimeoutMs: number;
   candidateLimit: number;
   ffmpegPath: string;
   ffprobePath: string;
@@ -25,7 +27,7 @@ export interface AppConfig {
   audioSampleCount: number;
   audioSampleSeconds: number;
   audioConcurrency: number;
-  /** Ceiling on how many bytes one audio analysis may pull from the release. */
+  /** Estimated sampling budget; container seeking/probing adds overhead. */
   audioBudgetBytes: number;
   maxSyncOffsetSeconds: number;
   streamTtlMs: number;
@@ -100,6 +102,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dataDir: env.DATA_DIR || "./data",
     installToken: env.INSTALL_TOKEN || INSECURE_TOKEN,
     jobWaitMs: asInt(env.JOB_WAIT_MS, 120_000, 5_000, 600_000),
+    jobConcurrency: asInt(env.JOB_CONCURRENCY, 2, 1, 4),
+    jobTimeoutMs: asInt(env.JOB_TIMEOUT_MS, 600_000, 60_000, 1_800_000),
     candidateLimit: asInt(env.CANDIDATE_LIMIT, 10, 1, 50),
     ffmpegPath: env.FFMPEG_PATH || "ffmpeg",
     ffprobePath: env.FFPROBE_PATH || "ffprobe",

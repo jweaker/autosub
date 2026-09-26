@@ -38,8 +38,9 @@ abstract class ArrayTranslator implements Translator {
     const translated = await runBatches(batches, this.settings.concurrency, async (batch) => {
       const results = await this.send(batch.map((cue) => cue.text), source, target, signal);
       if (results.length !== batch.length) throw new Error(`${this.name} returned ${results.length}/${batch.length} translations`);
-      return new Map(batch.map((cue, index) => [cue.id, results[index].trim() || cue.text]));
-    });
+      if (results.some((text) => !text.trim())) throw new Error(`${this.name} returned an empty translation`);
+      return new Map(batch.map((cue, index) => [cue.id, results[index].trim()]));
+    }, { signal });
     const usage = { characters: countCharacters(cues) };
     const result = cues.map((cue) => ({ ...cue, text: translated.get(cue.id) || cue.text }));
     this.lastUsage = usage;

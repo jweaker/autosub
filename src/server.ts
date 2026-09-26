@@ -20,7 +20,7 @@ await registry.load();
 const upstream = new UpstreamStreamAddon(config.upstreamAddonUrl, registry);
 const cache = new SubtitleCache(config.dataDir);
 const pipeline = new AutoSubPipeline(config, providers, cache);
-const jobs = new JobManager(pipeline);
+const jobs = new JobManager(pipeline, undefined, config.jobConcurrency, config.jobTimeoutMs);
 const app = createApp({ config, registry, upstream, jobs, providers, pipeline, cache });
 
 const server = app.listen(config.port, "0.0.0.0", () => {
@@ -29,6 +29,7 @@ const server = app.listen(config.port, "0.0.0.0", () => {
 });
 
 const maintenance = setInterval(() => {
+  jobs.prune();
   void registry.sweep();
   void cache.sweep(config.cacheTtlMs).then((removed) => {
     if (removed) console.log(`Removed ${removed} expired cached subtitles`);
@@ -46,6 +47,7 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     shuttingDown = true;
     console.log(`Received ${signal}; shutting down`);
     clearInterval(maintenance);
+    jobs.shutdown();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS).unref();
   });

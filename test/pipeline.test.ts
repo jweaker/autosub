@@ -453,3 +453,58 @@ describe("subtitle pipeline", () => {
       .rejects.toThrow(/Audio analysis is disabled/);
   });
 });
+
+
+describe("review regressions", () => {
+  it("never labels an English reference as Arabic when both languages were searched", async () => {
+    const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(sourceCues) }]]));
+    const pipeline = new AutoSubPipeline(await config({ REFERENCE_LANGUAGES: "ar,en" }), [provider]);
+    await expect(pipeline.complete(request, stream, "ar")).rejects.toThrow(/translation is not configured/);
+  });
+});
+
+it("applies the activity threshold even when a candidate came through source validation", async () => {
+  const alignment = await import("../src/alignment.js");
+  const align = vi.spyOn(alignment, "alignSubtitleToTranscript").mockImplementation((cues) => ({
+    cues, confidence: 60, evidence: "activity", offsetMs: 0, anchors: [],
+  }));
+  try {
+    const provider = new FakeProvider("fake", new Map([["en-1", { language: "en", content: serializeSrt(sourceCues) }]]));
+    const pipeline = new AutoSubPipeline(await config({ MINIMUM_CONFIDENCE: "58", ACTIVITY_MINIMUM_CONFIDENCE: "70", FALLBACK_REFERENCE_LANGUAGES: "" }), [provider]);
+    await expect(pipeline.complete(request, stream, "ar")).rejects.toThrow(/No subtitle in en matched/);
+  } finally { align.mockRestore(); }
+});
+
+it("reuses parsing and source alignment when trying another reference", async () => {
+  const alignment = await import("../src/alignment.js");
+  const content = await import("../src/subtitle-content.js");
+  const parse = vi.spyOn(content, "prepareSubtitle");
+  const source = vi.spyOn(alignment, "alignSubtitleToTranscript");
+  const target = vi.spyOn(alignment, "alignSubtitleToReference").mockImplementation((cues) => ({ cues, confidence: 0, offsetMs: 0, anchors: [], evidence: "reference" }));
+  try {
+    const files = new Map([
+      ["en-1", { language: "en", content: serializeSrt(sourceCues) }],
+      ["en-2", { language: "en", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: cue.text + " more" }))) }],
+      ["ar-1", { language: "ar", content: serializeSrt(sourceCues.map((cue) => ({ ...cue, text: `عربي ${cue.id}` }))) }],
+    ]);
+    const pipeline = new AutoSubPipeline(await config({ FALLBACK_REFERENCE_LANGUAGES: "", ACTIVITY_MINIMUM_CONFIDENCE: "100" }), [new FakeProvider("fake", files)]);
+    await expect(pipeline.complete(request, stream, "ar")).rejects.toThrow(/translation is not configured/);
+    expect(parse).toHaveBeenCalledTimes(3);
+    expect(source).toHaveBeenCalledTimes(2);
+    expect(target).toHaveBeenCalledTimes(2);
+  } finally { parse.mockRestore(); source.mockRestore(); target.mockRestore(); }
+});
+
+it("starts target search and audio before metadata resolves", async () => {
+  const provider = new FakeProvider("fake", new Map());
+  const pipeline = new AutoSubPipeline(await config(), [provider]);
+  let finish!: (language: string) => void;
+  const internals = pipeline as unknown as { metadata: { originalLanguage: () => Promise<string> } };
+  internals.metadata.originalLanguage = () => new Promise((resolve) => { finish = resolve; });
+  const pending = pipeline.complete(request, stream, "ar");
+  const failed = expect(pending).rejects.toThrow(/No subtitle/);
+  await vi.waitFor(() => expect(provider.searches).toBe(1));
+  expect(analyses.count).toBe(1);
+  finish("en");
+  await failed;
+});

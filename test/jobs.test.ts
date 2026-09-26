@@ -88,3 +88,40 @@ describe("job manager", () => {
     await expect(jobs.result(id, 100)).rejects.toBeInstanceOf(JobExpiredError);
   });
 });
+
+it("bounds concurrent jobs, keeps queued requests shared, and drains the queue", async () => {
+  const finish: Array<(value: CompletedSubtitle) => void> = [];
+  const complete = vi.fn(() => new Promise<CompletedSubtitle>((resolve) => finish.push(resolve)));
+  const jobs = new JobManager(pipelineOf(complete), undefined, 1);
+  const first = jobs.start(request, stream, "ar");
+  const second = jobs.start({ ...request, contentId: "tt2" }, stream, "ar");
+  expect(jobs.start({ ...request, contentId: "tt2" }, stream, "ar")).toBe(second);
+  expect(jobs.running).toBe(1);
+  expect(jobs.queued).toBe(1);
+  expect(complete).toHaveBeenCalledTimes(1);
+  finish[0](completed("first"));
+  await jobs.result(first, 1000);
+  expect(complete).toHaveBeenCalledTimes(2);
+  finish[1](completed("second"));
+  expect((await jobs.result(second, 1000)).provider).toBe("second");
+  jobs.invalidate(["k"]);
+  await expect(jobs.result(second, 100)).rejects.toBeInstanceOf(JobExpiredError);
+  const third = jobs.start(request, stream, "ar");
+  expect(third).not.toBe(first);
+  finish[2](completed("third"));
+  await jobs.result(third, 1000);
+});
+
+it("cancels a timed-out job and lets the next title run", async () => {
+  const complete = vi.fn(async (_request, _stream, _language, signal?: AbortSignal) => {
+    signal?.throwIfAborted();
+    return new Promise<CompletedSubtitle>((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  });
+  const jobs = new JobManager(pipelineOf(complete), undefined, 1, 20);
+  const first = jobs.start(request, stream, "ar");
+  const second = jobs.start({ ...request, contentId: "tt2" }, stream, "ar");
+  await expect(jobs.result(first, 1000)).rejects.toMatchObject({ code: "deadline" });
+  expect(complete).toHaveBeenCalledTimes(2);
+  jobs.shutdown();
+  await expect(jobs.result(second, 1000)).rejects.toMatchObject({ code: "unavailable" });
+});

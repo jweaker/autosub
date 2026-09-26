@@ -550,7 +550,7 @@ function shifted(mapping: MappingScore, shift: number, evaluate: (offsetMs: numb
   return candidate.score >= mapping.score * 0.7 ? candidate : mapping;
 }
 
-function resultForMapping(cues: SubtitleCue[], windows: VadWindow[], mapping: MappingScore, confidence: number): AlignmentResult {
+function resultForMapping(cues: SubtitleCue[], windows: VadWindow[], mapping: MappingScore, confidence: number, evidence: AlignmentResult["evidence"] = "activity"): AlignmentResult {
   const aligned = cues.map((cue) => {
     const startMs = (cue.startMs * mapping.rate) + mapping.offsetMs;
     const endMs = (cue.endMs * mapping.rate) + mapping.offsetMs;
@@ -565,10 +565,10 @@ function resultForMapping(cues: SubtitleCue[], windows: VadWindow[], mapping: Ma
     };
   });
   const middle = cues[Math.floor(cues.length / 2)]?.startMs || 0;
-  return { cues: aligned, confidence, offsetMs: Math.round((middle * (mapping.rate - 1)) + mapping.offsetMs), rate: mapping.rate, anchors };
+  return { cues: aligned, confidence, offsetMs: Math.round((middle * (mapping.rate - 1)) + mapping.offsetMs), rate: mapping.rate, anchors, evidence };
 }
 
-const unaligned = (cues: SubtitleCue[]): AlignmentResult => ({ cues, confidence: 0, offsetMs: 0, anchors: [] });
+const unaligned = (cues: SubtitleCue[]): AlignmentResult => ({ cues, confidence: 0, offsetMs: 0, anchors: [], evidence: "activity" });
 
 /** Matches subtitle cue spans against the local speech-activity timeline. */
 export function alignSubtitle(cues: SubtitleCue[], windows: VadWindow[], maxOffsetMs = 180_000): AlignmentResult {
@@ -685,7 +685,7 @@ export function alignSubtitleToTranscript(cues: SubtitleCue[], windows: VadWindo
   const uniqueness = Math.min(1, distinctiveness / 0.16);
   const coverage = Math.min(1, strong / Math.max(2, transcriptWindows));
   const confidence = Math.round(100 * ((signal * 0.72) + (uniqueness * 0.28)) * coverage);
-  return resultForMapping(cues, windows, best, confidence);
+  return resultForMapping(cues, windows, best, confidence, "transcript");
 }
 
 /** Cue-start index for reference alignment, cached per cue array. */
@@ -817,5 +817,5 @@ export function alignSubtitleToReference(target: SubtitleCue[], reference: Subti
     speech: [],
     transcript: String(score),
   }));
-  return resultForMapping(target, pseudoWindows, best, confidence);
+  return resultForMapping(target, pseudoWindows, best, confidence, "reference");
 }

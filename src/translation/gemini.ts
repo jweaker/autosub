@@ -1,6 +1,6 @@
 import type { SubtitleCue } from "../domain.js";
-import { isTransient, requestJson } from "../http.js";
-import { collectRows, parseRows, translationPrompt } from "./prompt.js";
+import { requestJson } from "../http.js";
+import { collectRows, parseRows, translationPrompt, TranslationResponseError } from "./prompt.js";
 import { assertTranslationChanged, batchCues, contextFor, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
 export interface GeminiSettings {
@@ -78,8 +78,8 @@ export class GeminiTranslator implements Translator {
         return collectRows(batch, parseRows(text));
       } catch (error) {
         lastError = error;
-        if (signal?.aborted) throw new Error("Translation aborted");
-        if (isTransient(error)) throw error;
+        signal?.throwIfAborted();
+        if (!(error instanceof TranslationResponseError)) throw error;
         if (attempt >= SCHEMA_ATTEMPTS) break;
       }
     }
@@ -95,6 +95,7 @@ export class GeminiTranslator implements Translator {
       batch,
       (part) => this.translateBatch(part, source, target, context(part), usage, signal),
     ), {
+      signal,
       onConcurrencyReduced: (concurrency) => {
         this.effectiveConcurrency = Math.min(this.effectiveConcurrency, concurrency);
       },

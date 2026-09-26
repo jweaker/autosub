@@ -11,6 +11,8 @@ export interface RequestOptions extends Omit<RequestInit, "signal"> {
   attempts?: number;
   /** Caller-owned cancellation, typically a pipeline-wide budget. */
   signal?: AbortSignal;
+  /** Maximum buffered response bytes, including chunked responses. */
+  maxBytes?: number;
   /** Label used in error messages, e.g. "OpenSubtitles search". */
   label?: string;
 }
@@ -69,7 +71,7 @@ function backoffMs(attempt: number, response?: Response): number {
  * that retrying them individually used to be reimplemented per call site.
  */
 export async function request(url: string | URL, options: RequestOptions = {}): Promise<Response> {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, attempts = 2, signal, label, ...init } = options;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, attempts = 2, signal, label, maxBytes: _maxBytes, ...init } = options;
   const name = label || new URL(url).host;
   let lastError: unknown;
 
@@ -80,7 +82,7 @@ export async function request(url: string | URL, options: RequestOptions = {}): 
     try {
       const response = await fetch(url, { ...init, signal: combined });
       if (response.ok) return response;
-      const detail = (await response.text().catch(() => "")).slice(0, 200);
+      const detail = new TextDecoder().decode(await readBody(response, 4096).catch(() => new Uint8Array())).slice(0, 200);
       const requestedDelay = retryAfterMs(response);
       const error = new HttpError(response.status, name, detail, requestedDelay);
       if (attempt >= attempts || !error.retryable) throw error;
@@ -105,10 +107,35 @@ export async function request(url: string | URL, options: RequestOptions = {}): 
 
 export async function requestJson<T>(url: string | URL, options: RequestOptions = {}): Promise<T> {
   const response = await request(url, options);
-  return (await response.json()) as T;
+  return JSON.parse(new TextDecoder().decode(await readBody(response, options.maxBytes ?? 2 * 1024 * 1024))) as T;
 }
 
 export async function requestBytes(url: string | URL, options: RequestOptions = {}): Promise<Uint8Array> {
   const response = await request(url, options);
-  return new Uint8Array(await response.arrayBuffer());
+  return readBody(response, options.maxBytes ?? 15 * 1024 * 1024);
+}
+
+
+async function readBody(response: Response, limit: number): Promise<Uint8Array> {
+  if (Number(response.headers.get("content-length")) > limit) {
+    await response.body?.cancel();
+    throw new Error(`Response exceeds the ${limit} byte limit`);
+  }
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > limit) throw new Error(`Response exceeds the ${limit} byte limit`);
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks, size);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }

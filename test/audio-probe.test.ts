@@ -37,3 +37,38 @@ describe("audio probe", () => {
     expect(probe.calls).toEqual(["ffprobe"]);
   });
 });
+
+it("does not seek replacement audio when activity-only samples already contain speech", async () => {
+  const analyser = new AudioAnalyzer(loadConfig({}));
+  const internals = analyser as unknown as {
+    resolveMediaUrl: () => Promise<string>;
+    probe: () => Promise<unknown>;
+    analyser: () => (startMs: number) => Promise<unknown>;
+  };
+  internals.resolveMediaUrl = async () => stream.url;
+  internals.probe = async () => ({ durationMs: 7200000, durationKnown: true, streams: [audio], bytesPerSecond: 1_000_000 });
+  const sample = vi.fn(async (startMs: number) => ({
+    pcm: Buffer.alloc(0),
+    window: { startMs, durationMs: 15000, speech: [{ startMs: 1000, endMs: 5000 }] },
+  }));
+  internals.analyser = () => sample;
+  expect((await analyser.analyze(stream)).windows).toHaveLength(4);
+  expect(sample).toHaveBeenCalledTimes(4);
+});
+
+it("starts another sample while an earlier worker is still busy", async () => {
+  const analyser = new AudioAnalyzer(loadConfig({ AUDIO_CONCURRENCY: "2" }));
+  const collect = (analyser as unknown as { collect: (starts: number[], work: (start: number) => Promise<undefined>) => Promise<unknown> }).collect.bind(analyser);
+  let finish!: () => void;
+  const slow = new Promise<void>((resolve) => { finish = resolve; });
+  const started: number[] = [];
+  const pending = collect([1, 2, 3], async (start) => {
+    started.push(start);
+    if (start === 1) await slow;
+    return undefined;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(started).toEqual([1, 2, 3]);
+  finish();
+  await pending;
+});

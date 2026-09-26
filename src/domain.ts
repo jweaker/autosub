@@ -68,6 +68,7 @@ export interface AudioProbeResult {
 }
 
 export interface AlignmentResult {
+  evidence: "activity" | "transcript" | "reference";
   cues: SubtitleCue[];
   confidence: number;
   offsetMs: number;

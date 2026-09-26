@@ -26,15 +26,22 @@ const list = await fetch(`${base}/${token}/subtitles/movie/${encodeURIComponent(
 const listBody = await list.json();
 const subtitle = listBody.subtitles?.[0];
 if (!subtitle?.url) throw new Error("No AutoSub subtitle was listed");
-const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), 180_000);
-const response = await fetch(subtitle.url, { signal: controller.signal });
-clearTimeout(timer);
-const content = await response.text();
+const deadline = Date.now() + 600_000;
+let response;
+let content;
+for (;;) {
+  const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+  response = await fetch(subtitle.url, { signal });
+  content = await response.text();
+  if (response.headers.get("x-autosub-state") !== "preparing" || Date.now() >= deadline) break;
+  console.log("Subtitle is still preparing; checking the same job again.");
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+}
 const starts = [...content.matchAll(/(?:^|\n)(\d{2}):(\d{2}):(\d{2}),(\d{3}) -->/g)]
   .map((match) => (((Number(match[1]) * 60 + Number(match[2])) * 60 + Number(match[3])) * 1000) + Number(match[4]));
 console.log(JSON.stringify({
   status: response.status,
+  state: response.headers.get("x-autosub-state") || "ready",
   release: selected.behaviorHints?.filename || selected.title || "unnamed",
   elapsedMs: Date.now() - started,
   provider: response.headers.get("x-autosub-provider"),
@@ -45,4 +52,4 @@ console.log(JSON.stringify({
   lastStartMs: starts.at(-1),
   error: response.ok ? undefined : content.slice(0, 200),
 }, null, 2));
-if (!response.ok) process.exitCode = 1;
+if (!response.ok || response.headers.has("x-autosub-state") || !response.headers.has("x-autosub-provider") || !starts.length) process.exitCode = 1;

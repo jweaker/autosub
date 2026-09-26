@@ -87,3 +87,16 @@ describe("subtitle preparation", () => {
     expect(() => prepareSubtitle(archive, candidate())).toThrow(/no supported text subtitle/);
   });
 });
+
+
+it("normalizes WebVTT timestamps without hours", () => {
+  expect(prepareSubtitle(bytes("WEBVTT\n\n00:01.000 --> 00:02.500 align:start\nHello\n"), candidate()))
+    .toContain("00:00:01,000 --> 00:00:02,500");
+});
+
+it("bounds the aggregate size and file count of an archive", () => {
+  const large = zipSync(Object.fromEntries(Array.from({ length: 4 }, (_, i) => [`${i}.srt`, new Uint8Array(4 * 1024 * 1024)])));
+  expect(() => prepareSubtitle(large, candidate())).toThrow(/extraction limit/);
+  const many = zipSync(Object.fromEntries(Array.from({ length: 501 }, (_, i) => [`${i}.txt`, bytes("x")])));
+  expect(() => prepareSubtitle(many, candidate())).toThrow(/too many files/);
+});

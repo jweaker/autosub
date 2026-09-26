@@ -74,3 +74,15 @@ describe("outbound requests", () => {
     expect(isTransient(new Error("bad subtitle"))).toBe(false);
   });
 });
+
+it("cancels a chunked download as soon as it exceeds its byte limit", async () => {
+  const cancel = vi.fn();
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(8)); controller.enqueue(new Uint8Array(8)); },
+    cancel,
+  });
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+  const { requestBytes } = await import("../src/http.js");
+  await expect(requestBytes("https://test/download", { maxBytes: 10 })).rejects.toThrow(/byte limit/);
+  expect(cancel).toHaveBeenCalledOnce();
+});

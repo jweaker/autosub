@@ -1,3 +1,4 @@
+import { safeError } from "./errors.js";
 import type { MediaType } from "./domain.js";
 import { requestJson } from "./http.js";
 import { normalizeLanguage } from "./languages.js";
@@ -17,7 +18,7 @@ export class MetadataService {
 
   constructor(private readonly tmdbToken?: string, private readonly timeoutMs = 8_000) {}
 
-  async originalLanguage(imdbId: string | undefined, type: MediaType): Promise<string | undefined> {
+  async originalLanguage(imdbId: string | undefined, type: MediaType, signal?: AbortSignal): Promise<string | undefined> {
     if (!this.tmdbToken || !imdbId) return undefined;
     const key = `${type}:${imdbId}`;
     if (this.cache.has(key)) return this.cache.get(key);
@@ -28,6 +29,7 @@ export class MetadataService {
       const body = await requestJson<FindResponse>(url, {
         headers: { Authorization: `Bearer ${this.tmdbToken}`, Accept: "application/json" },
         timeoutMs: this.timeoutMs,
+        signal,
         label: "TMDB find",
       });
       const raw = type === "series" ? body.tv_results?.[0]?.original_language : body.movie_results?.[0]?.original_language;
@@ -35,8 +37,9 @@ export class MetadataService {
       this.cache.set(key, language);
       return language;
     } catch (error) {
+      signal?.throwIfAborted();
       // Metadata is advisory; a failure must not stop subtitle preparation.
-      console.warn("TMDB lookup failed:", error instanceof Error ? error.message : error);
+      console.warn("TMDB lookup failed:", safeError(error));
       return undefined;
     }
   }

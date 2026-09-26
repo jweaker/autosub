@@ -1,3 +1,4 @@
+import { TranslationResponseError } from "../src/translation/prompt.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import type { SubtitleCue } from "../src/domain.js";
@@ -284,7 +285,7 @@ describe("translation batching", () => {
     const sizes: number[] = [];
     const result = await runBatchResiliently(many, async (batch) => {
       sizes.push(batch.length);
-      if (batch.length > 12) throw new Error("truncated JSON");
+      if (batch.length > 12) throw new TranslationResponseError("truncated JSON");
       return new Map(batch.map((cue) => [cue.id, `ok ${cue.id}`]));
     });
     expect(sizes).toEqual([24, 12, 12]);
@@ -304,4 +305,14 @@ describe("translation batching", () => {
     const source = Array.from({ length: 20 }, (_, index) => ({ ...cues[0], id: index + 1, text: `original dialogue line ${index}` }));
     expect(() => assertTranslationChanged(source, source)).toThrow(/left 20\/20/);
   });
+});
+
+
+it("fails a permanent translation HTTP error without retries or splits", async () => {
+  const fetchMock = vi.fn(async () => new Response("bad credentials", { status: 401 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const many = Array.from({ length: 120 }, (_, id) => ({ ...cues[0], id }));
+  await expect(new OpenAiCompatibleTranslator({ baseUrl: "https://test/v1", model: "test", concurrency: 1 })
+    .translate(many, "en", "ar")).rejects.toThrow(/401/);
+  expect(fetchMock).toHaveBeenCalledOnce();
 });

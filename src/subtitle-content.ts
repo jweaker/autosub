@@ -44,8 +44,16 @@ function chooseArchiveFile(files: Record<string, Uint8Array>, candidate: Subtitl
 function unpack(bytes: Uint8Array, candidate: SubtitleCandidate): { name: string; bytes: Uint8Array } {
   if (bytes.length > MAX_DOWNLOAD_BYTES) throw new Error("Subtitle download exceeds safety limit");
   if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+    let total = 0;
+    let count = 0;
     const files = unzipSync(bytes, {
-      filter: (file) => SUPPORTED.test(file.name) && !JUNK.test(file.name) && file.originalSize <= MAX_SUBTITLE_BYTES,
+      filter: (file) => {
+        if (++count > 500) throw new Error("Subtitle archive contains too many files");
+        if (!SUPPORTED.test(file.name) || JUNK.test(file.name) || file.originalSize > MAX_SUBTITLE_BYTES) return false;
+        total += file.originalSize;
+        if (total > MAX_DOWNLOAD_BYTES) throw new Error("Subtitle archive exceeds the extraction limit");
+        return true;
+      },
     });
     const [name, extracted] = chooseArchiveFile(files, candidate);
     return { name, bytes: extracted };
@@ -134,7 +142,7 @@ function vttToSrt(input: string): string {
     const lines = block.split("\n").filter(Boolean);
     const timingIndex = lines.findIndex((line) => line.includes("-->"));
     if (timingIndex < 0) continue;
-    const timing = lines[timingIndex].replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, "$1,$2").replace(/\s+(?:align|position|size|line):\S+/g, "");
+    const timing = lines[timingIndex].replace(/(?:(\d{2,}):)?(\d{2}:\d{2})\.(\d{3})/g, (_match, hours: string | undefined, rest: string, milliseconds: string) => `${hours || "00"}:${rest},${milliseconds}`).replace(/\s+(?:align|position|size|line):\S+/g, "");
     const text = lines.slice(timingIndex + 1).join("\n").trim();
     if (text) cues.push(`${cues.length + 1}\n${timing}\n${text}`);
   }

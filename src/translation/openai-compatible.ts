@@ -1,6 +1,6 @@
 import type { SubtitleCue } from "../domain.js";
-import { HttpError, isTransient, requestJson } from "../http.js";
-import { collectRows, parseRows, translationPrompt } from "./prompt.js";
+import { HttpError, requestJson } from "../http.js";
+import { collectRows, parseRows, translationPrompt, TranslationResponseError } from "./prompt.js";
 import { assertTranslationChanged, batchCues, batchSizeFor, contextFor, countCharacters, runBatchResiliently, runBatches, type TranslationUsage, type Translator } from "./types.js";
 
 export interface OpenAiCompatibleSettings {
@@ -99,7 +99,7 @@ export class OpenAiCompatibleTranslator implements Translator {
         return collectRows(batch, parseRows(body.choices?.[0]?.message?.content || ""));
       } catch (error) {
         lastError = error;
-        if (signal?.aborted) throw new Error("Translation aborted");
+        signal?.throwIfAborted();
         // A rejected request shape is worth one free retry: it means the
         // endpoint is stricter than the defaults, not that translation failed.
         if (!this.minimalPayload && error instanceof HttpError && (error.status === 400 || error.status === 422)) {
@@ -109,7 +109,7 @@ export class OpenAiCompatibleTranslator implements Translator {
         }
         // requestJson already retried transport faults. A schema retry here
         // would make every parallel worker hammer the same saturated gateway.
-        if (isTransient(error)) throw error;
+        if (!(error instanceof TranslationResponseError)) throw error;
         attempt += 1;
         if (attempt >= SCHEMA_ATTEMPTS) break;
       }
@@ -127,6 +127,7 @@ export class OpenAiCompatibleTranslator implements Translator {
       batch,
       (part) => this.translateBatch(part, source, target, context(part), usage, signal),
     ), {
+      signal,
       onConcurrencyReduced: (concurrency) => {
         this.effectiveConcurrency = Math.min(this.effectiveConcurrency, concurrency);
       },
