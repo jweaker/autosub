@@ -4,8 +4,16 @@ const base = process.env.PUBLIC_URL?.replace(/\/$/, "");
 const token = process.env.INSTALL_TOKEN;
 if (!base || !token) throw new Error("PUBLIC_URL and INSTALL_TOKEN are required");
 
+// Exercise the public route with a browser-style agent, as Stremio clients do.
+// Cloudflare Browser Integrity Check can reject Node's default user agent.
+const checkedFetch = (url, options = {}) => fetch(url, {
+  ...options,
+  headers: { "User-Agent": "Mozilla/5.0 AutoSubSmoke/2.0", ...options.headers },
+  signal: options.signal || AbortSignal.timeout(40_000),
+});
+
 const started = Date.now();
-const streamResponse = await fetch(`${base}/${token}/stream/movie/${encodeURIComponent(contentId)}.json`);
+const streamResponse = await checkedFetch(`${base}/${token}/stream/movie/${encodeURIComponent(contentId)}.json`);
 if (!streamResponse.ok) throw new Error(`stream endpoint returned ${streamResponse.status}`);
 const streamBody = await streamResponse.json();
 const streams = Array.isArray(streamBody.streams) ? streamBody.streams : [];
@@ -18,11 +26,11 @@ const selected = releaseFragment
   ? streams.find((stream) => String(stream.behaviorHints?.filename || stream.title || "").toLowerCase().includes(releaseFragment.toLowerCase()))
   : streams[0];
 if (!selected?.url) throw new Error(`Requested release was not found among ${streams.length} streams`);
-const play = await fetch(selected.url, { redirect: "manual" });
+const play = await checkedFetch(selected.url, { redirect: "manual" });
 await play.body?.cancel();
 if (play.status !== 302) throw new Error(`play endpoint returned ${play.status}`);
 
-const list = await fetch(`${base}/${token}/subtitles/movie/${encodeURIComponent(contentId)}.json`);
+const list = await checkedFetch(`${base}/${token}/subtitles/movie/${encodeURIComponent(contentId)}.json`);
 const listBody = await list.json();
 const subtitle = listBody.subtitles?.[0];
 if (!subtitle?.url) throw new Error("No AutoSub subtitle was listed");
@@ -31,7 +39,7 @@ let response;
 let content;
 for (;;) {
   const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
-  response = await fetch(subtitle.url, { signal });
+  response = await checkedFetch(subtitle.url, { signal });
   content = await response.text();
   if (response.headers.get("x-autosub-state") !== "preparing" || Date.now() >= deadline) break;
   console.log("Subtitle is still preparing; checking the same job again.");
